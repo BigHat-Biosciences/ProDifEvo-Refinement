@@ -260,6 +260,75 @@ def pdb_to_globularity_score(gen_pdb_file, start=None, end=None):
     return -float(np.std(np.linalg.norm(m, axis=-1)))
 
 
+# ============================================================
+# Antibody-specific reward functions
+# ============================================================
+
+# Amino acid charge at physiological pH (~7.4)
+_AA_CHARGE = {
+    'D': -1.0, 'E': -1.0,  # acidic (negative)
+    'K': 1.0, 'R': 1.0,    # basic (positive)
+    'H': 0.1,              # histidine partially protonated at pH 7.4
+}
+
+
+def esm_to_cdr_plddt(folding_result, cdr_indices, idx=0):
+    """Compute mean pLDDT restricted to CDR residue positions.
+
+    Args:
+        folding_result: Output of esmfold.infer(sequences).
+        cdr_indices: List of 0-based CDR residue positions.
+        idx: Batch index.
+
+    Returns:
+        Mean pLDDT over CDR positions, scaled to [0, 1].
+    """
+    # ESMFold plddt tensor shape is [B, L, 1]; squeeze trailing dim
+    plddt_all = folding_result['plddt'][idx].squeeze()  # [L]
+    if plddt_all.dim() > 1:
+        plddt_all = plddt_all.mean(dim=-1)
+    cdr_plddt = plddt_all[cdr_indices].mean().cpu().item() / 100.0
+    return cdr_plddt
+
+
+def cdr_charge_score(sequence_str, cdr_indices):
+    """Score CDR charge balance. More balanced (lower absolute charge) is better.
+
+    Args:
+        sequence_str: Full amino acid sequence string.
+        cdr_indices: List of 0-based CDR residue positions.
+
+    Returns:
+        Negative absolute net charge per CDR residue (higher = more balanced = better).
+    """
+    cdr_residues = [sequence_str[i] for i in cdr_indices if i < len(sequence_str)]
+    if len(cdr_residues) == 0:
+        return 0.0
+    net_charge = sum(_AA_CHARGE.get(aa, 0.0) for aa in cdr_residues)
+    return -abs(net_charge) / len(cdr_residues)
+
+
+def cdr_hydrophobicity_score(gen_pdb_file, cdr_indices):
+    """Score CDR hydrophobicity (lower exposed hydrophobics = better developability).
+
+    Wraps the existing pdb_to_hydrophobic_score with CDR-specific residue range.
+
+    Args:
+        gen_pdb_file: PDB file path or string.
+        cdr_indices: List of 0-based CDR residue positions.
+
+    Returns:
+        Negative ratio of hydrophobic surface-exposed CDR atoms (higher = less hydrophobic = better).
+    """
+    if len(cdr_indices) == 0:
+        return 0.0
+    # Use the min/max of CDR indices as the residue range
+    # Note: pdb_to_hydrophobic_score uses 0-based residue indexing via atom_array
+    start = min(cdr_indices)
+    end = max(cdr_indices) + 1
+    return pdb_to_hydrophobic_score(gen_pdb_file, start_residue_index=start, end_residue_index=end)
+
+
 def pair_diversity(seq1, seq2, mask1, mask2):
     n = len(seq1)
     assert len(seq2) == n, "Sequences must be the same length"
