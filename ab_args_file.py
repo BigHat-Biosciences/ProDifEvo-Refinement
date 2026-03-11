@@ -71,5 +71,17 @@ def get_ab_args():
         help="Reference PDB file for structural comparison metrics (tm, crmsd, etc.).",
     )
 
+    # Binder design: antigen structure for complex prediction + ipTM reward
+    argparser.add_argument(
+        "--antigen_pdb", type=str, default=None,
+        help="Path to antigen PDB/CIF structure file. Required for 'iptm' metric. "
+             "The antigen sequence is extracted and used for complex prediction.",
+    )
+    argparser.add_argument(
+        "--antigen_chain", type=str, default=None,
+        help="Antigen chain ID(s) to use from the antigen PDB. "
+             "If None, all chains are used. For multiple chains, comma-separate: 'A,B'.",
+    )
+
     args = argparser.parse_args()
     return args

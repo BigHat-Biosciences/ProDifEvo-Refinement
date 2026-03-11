@@ -264,6 +264,98 @@ def pdb_to_globularity_score(gen_pdb_file, start=None, end=None):
 # Antibody-specific reward functions
 # ============================================================
 
+import torch as _torch
+
+
+def compute_iptm(tm_logits, ab_len, ag_len, max_bin=31, no_bins=64, eps=1e-8):
+    """Compute interface pTM (ipTM) from TM-score logits.
+
+    ipTM measures predicted structural accuracy at the antibody-antigen interface.
+    Uses the same TM-score formula as pTM but restricted to inter-chain residue pairs.
+
+    Args:
+        tm_logits: [N_res, N_res, N_bins] TM-score head logits from ESMFold.
+        ab_len: Length of antibody chain (first chain).
+        ag_len: Length of antigen chain (second chain).
+        max_bin: Maximum bin distance for TM-score computation.
+        no_bins: Number of bins.
+        eps: Epsilon for numerical stability.
+
+    Returns:
+        ipTM score (float).
+    """
+    device = tm_logits.device
+    n = tm_logits.shape[-2]  # total residues (ab + ag)
+
+    boundaries = _torch.linspace(0, max_bin, steps=(no_bins - 1), device=device)
+    step = boundaries[1] - boundaries[0]
+    bin_centers = _torch.cat([boundaries + step / 2,
+                              (boundaries[-1] + step * 1.5).unsqueeze(0)])
+
+    clipped_n = max(n, 19)
+    d0 = 1.24 * (clipped_n - 15) ** (1.0 / 3) - 1.8
+
+    probs = _torch.nn.functional.softmax(tm_logits, dim=-1)  # [N, N, bins]
+    tm_per_bin = 1.0 / (1 + (bin_centers ** 2) / (d0 ** 2))
+    predicted_tm_term = _torch.sum(probs * tm_per_bin, dim=-1)  # [N, N]
+
+    # Inter-chain mask: 1 where residue i and j are from different chains
+    interface_mask = _torch.zeros(n, n, device=device)
+    interface_mask[:ab_len, ab_len:ab_len + ag_len] = 1.0
+    interface_mask[ab_len:ab_len + ag_len, :ab_len] = 1.0
+
+    # For each alignment reference position i, compute TM over inter-chain partners j
+    masked_tm = predicted_tm_term * interface_mask  # [N, N]
+    n_interface_per_row = interface_mask.sum(dim=-1)  # [N]
+
+    # Only consider rows that have inter-chain partners
+    valid = n_interface_per_row > 0
+    per_alignment = _torch.zeros(n, device=device)
+    per_alignment[valid] = masked_tm[valid].sum(dim=-1) / n_interface_per_row[valid]
+
+    # Return max over alignment positions (standard TM-score convention)
+    return per_alignment.max().item()
+
+
+def esm_to_iptm(folding_result, ab_len, ag_len, idx=0):
+    """Extract ipTM from ESMFold complex prediction output.
+
+    Tries to compute proper ipTM from TM-score logits. If logits are not
+    available, falls back to the global pTM of the complex as a proxy.
+
+    Args:
+        folding_result: Output dict from esmfold.infer().
+        ab_len: Antibody sequence length.
+        ag_len: Antigen sequence length.
+        idx: Batch index.
+
+    Returns:
+        ipTM score (float, higher = better predicted interface).
+    """
+    # Try proper ipTM from TM-score logits
+    if 'tm_logits' in folding_result:
+        logits = folding_result['tm_logits'][idx]  # [N, N, bins]
+        return compute_iptm(logits, ab_len, ag_len)
+
+    # Fallback: use predicted_aligned_error to approximate
+    if 'predicted_aligned_error' in folding_result:
+        pae = folding_result['predicted_aligned_error'][idx]  # [N, N]
+        n = pae.shape[0]
+        # Extract inter-chain PAE block and convert to a score (lower PAE = better)
+        interface_pae_ab_ag = pae[:ab_len, ab_len:ab_len + ag_len]
+        interface_pae_ag_ab = pae[ab_len:ab_len + ag_len, :ab_len]
+        mean_interface_pae = (interface_pae_ab_ag.mean() + interface_pae_ag_ab.mean()) / 2
+        max_pae = pae.max()
+        # Convert to [0,1] score: 1 = perfect (PAE=0), 0 = worst
+        return max(0.0, 1.0 - (mean_interface_pae / max_pae).cpu().item())
+
+    # Last resort: use complex pTM as a proxy
+    if 'ptm' in folding_result:
+        return folding_result['ptm'].cpu().tolist()[idx]
+
+    raise ValueError("Cannot compute ipTM: no tm_logits, predicted_aligned_error, or ptm in output.")
+
+
 # Amino acid charge at physiological pH (~7.4)
 _AA_CHARGE = {
     'D': -1.0, 'E': -1.0,  # acidic (negative)

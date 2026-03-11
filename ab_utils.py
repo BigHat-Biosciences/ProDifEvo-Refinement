@@ -2,9 +2,11 @@
 
 Supports IMGT, Chothia, and Kabat numbering schemes.
 Can use ANARCI for automatic numbering or accept manual CDR indices.
+Also provides antigen sequence extraction from PDB/CIF files.
 """
 
 import numpy as np
+import os
 
 # CDR boundaries by numbering scheme (IMGT numbering on the IMGT-numbered sequence).
 # These are the IMGT-defined positions; after ANARCI numbering, CDR residues
@@ -186,3 +188,90 @@ def get_cdr_and_framework_indices(
     print(f"Framework positions ({len(framework_indices)}): {framework_indices[:5]}...{framework_indices[-5:]}")
 
     return cdr_indices, framework_indices
+
+
+def extract_sequence_from_structure(fpath, chain=None):
+    """Extract amino acid sequence(s) from a PDB or CIF file.
+
+    Args:
+        fpath: Path to PDB or CIF file.
+        chain: Optional chain ID or list of chain IDs. If None, all chains are used.
+
+    Returns:
+        If chain is a single ID: the sequence string for that chain.
+        If chain is None or a list: dict mapping chain_id -> sequence string.
+    """
+    import biotite.structure
+    from biotite.structure.io import pdbx, pdb
+    from biotite.structure.residues import get_residues
+    from biotite.structure import filter_peptide_backbone, get_chains
+    from biotite.sequence import ProteinSequence
+
+    if fpath.endswith('.cif'):
+        with open(fpath) as fin:
+            pdbxf = pdbx.PDBxFile.read(fin)
+        structure = pdbx.get_structure(pdbxf, model=1)
+    elif fpath.endswith('.pdb'):
+        with open(fpath) as fin:
+            pdbf = pdb.PDBFile.read(fin)
+        structure = pdb.get_structure(pdbf, model=1)
+    else:
+        raise ValueError(f"Unsupported file format: {fpath}. Use .pdb or .cif")
+
+    bbmask = filter_peptide_backbone(structure)
+    structure = structure[bbmask]
+    all_chains = get_chains(structure)
+
+    if len(all_chains) == 0:
+        raise ValueError(f"No chains found in {fpath}")
+
+    if chain is not None and not isinstance(chain, list):
+        chain_ids = [chain]
+    elif chain is not None:
+        chain_ids = chain
+    else:
+        chain_ids = list(all_chains)
+
+    seqs = {}
+    for cid in chain_ids:
+        if cid not in all_chains:
+            raise ValueError(f"Chain '{cid}' not found in {fpath}. Available: {list(all_chains)}")
+        chain_struct = structure[structure.chain_id == cid]
+        residue_identities = get_residues(chain_struct)[1]
+        seq = ''.join([ProteinSequence.convert_letter_3to1(r) for r in residue_identities])
+        seqs[cid] = seq
+
+    if isinstance(chain, str):
+        return seqs[chain]
+    return seqs
+
+
+def get_antigen_sequence(antigen_pdb, antigen_chain=None):
+    """Extract and concatenate antigen sequence(s) from a PDB/CIF file.
+
+    Args:
+        antigen_pdb: Path to antigen structure file.
+        antigen_chain: Optional chain ID(s). If None, all chains are concatenated.
+
+    Returns:
+        antigen_seq: Concatenated antigen sequence string.
+        chain_info: Dict with chain_id -> (start_idx, end_idx, sequence) in the concatenated sequence.
+    """
+    seqs = extract_sequence_from_structure(antigen_pdb, chain=antigen_chain)
+    if isinstance(seqs, str):
+        cid = antigen_chain if antigen_chain else "?"
+        return seqs, {cid: (0, len(seqs), seqs)}
+
+    # Multiple chains: concatenate
+    concat_seq = ""
+    chain_info = {}
+    for cid, seq in seqs.items():
+        start = len(concat_seq)
+        concat_seq += seq
+        chain_info[cid] = (start, len(concat_seq), seq)
+
+    print(f"Antigen sequence extracted ({len(concat_seq)} residues, {len(seqs)} chain(s)):")
+    for cid, (start, end, seq) in chain_info.items():
+        print(f"  Chain {cid}: {len(seq)} residues (positions {start}-{end-1})")
+
+    return concat_seq, chain_info
