@@ -4,6 +4,8 @@ Adapts the SVDD_edit pattern from generate.py to only modify CDR positions
 while keeping framework residues fixed.
 """
 
+import csv
+import os
 import random
 import numpy as np
 import torch
@@ -146,7 +148,7 @@ def generate_oaardm_cdr_edit(
                     loc_set[jjj].remove(chosen_pos)
 
         # End-of-iteration evaluation
-        _, reward_hoge, _ = reward_model.reward_metrics(
+        per_metric_rewards, reward_hoge, _ = reward_model.reward_metrics(
             protein_name=batch,
             mask_for_loss=mask_for_loss,
             S_sp=sample,
@@ -154,9 +156,27 @@ def generate_oaardm_cdr_edit(
             save_pdb=True,
             add_info=ttt,
         )
-        print(f"Iteration {ttt} rewards: {reward_hoge}")
-        with open(folder_path + '/ab_trajectory.txt', 'a') as f:
-            f.write(', '.join(map(str, reward_hoge)) + '\n')
+        # per_metric_rewards: list of lists, one per sample, each inner list = per-metric values
+        # reward_hoge: list of aggregate rewards, one per sample
+        metric_names = reward_model.metrics_name
+
+        # Write detailed per-iteration CSV (append mode; write header on first iteration)
+        trajectory_csv = os.path.join(folder_path, 'ab_trajectory.csv')
+        write_header = (ttt == 0) and not os.path.exists(trajectory_csv)
+        with open(trajectory_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(['iteration', 'sample_idx'] + metric_names + ['aggregate_reward'])
+            for _s_idx in range(repeat_num):
+                row = [ttt, _s_idx] + [f"{v:.6f}" for v in per_metric_rewards[_s_idx]] + [f"{reward_hoge[_s_idx]:.6f}"]
+                writer.writerow(row)
+
+        # Print summary
+        mean_agg = np.mean(reward_hoge)
+        per_metric_means = [np.mean([per_metric_rewards[s][m] for s in range(repeat_num)])
+                            for m in range(len(metric_names))]
+        metric_summary = ", ".join(f"{n}={v:.4f}" for n, v in zip(metric_names, per_metric_means))
+        print(f"Iteration {ttt}: agg={mean_agg:.4f}, {metric_summary}")
 
         # Return on final iteration
         if ttt == iteration - 1:
