@@ -75,12 +75,36 @@ def get_ab_args():
     argparser.add_argument(
         "--antigen_pdb", type=str, default=None,
         help="Path to antigen PDB/CIF structure file. Required for 'iptm' metric. "
-             "The antigen sequence is extracted and used for complex prediction.",
+             "Used directly as the AF2 binder-protocol target template.",
     )
     argparser.add_argument(
         "--antigen_chain", type=str, default=None,
         help="Antigen chain ID(s) to use from the antigen PDB. "
              "If None, all chains are used. For multiple chains, comma-separate: 'A,B'.",
+    )
+
+    # ---- AlphaFold2 backend settings ----
+    argparser.add_argument(
+        "--af_params_dir", type=str, default=None,
+        help="Path to the directory containing AlphaFold2 params (e.g. params_model_*_multimer_v3.npz). "
+             "If None, falls back to $AF_PARAMS_DIR or ~/.mber/af_params. "
+             "Use mber-open/download_weights.sh to fetch.",
+    )
+    argparser.add_argument(
+        "--num_recycles", type=int, default=3,
+        help="Number of AF2 recycling iterations per prediction.",
+    )
+    argparser.add_argument(
+        "--af_models", type=str, default="0",
+        help="Comma-separated AF2 model indices to ensemble (e.g. '0' or '0,1,2,3,4').",
+    )
+    argparser.add_argument(
+        "--af_use_multimer", action="store_true", default=True,
+        help="Use AF2 multimer params (v3 = 'AF2.3M'). Required for ipTM. Default: True.",
+    )
+    argparser.add_argument(
+        "--af_no_multimer", dest="af_use_multimer", action="store_false",
+        help="Disable AF2 multimer mode (use monomer params).",
     )
 
     args = argparser.parse_args()

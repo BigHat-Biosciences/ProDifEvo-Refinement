@@ -40,187 +40,18 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
-import esm
 
 from utils import set_seed
 from ab_args_file import get_ab_args
 from ab_utils import get_cdr_and_framework_indices, get_antigen_sequence
-from reward import (
-    esm_to_ptm, esm_to_plddt, esm_to_cdr_plddt, esm_to_iptm,
-    cdr_charge_score, cdr_hydrophobicity_score,
-    pdb_to_tm, pdb_to_crmsd, pdb_to_hydrophobic_score,
-    pdb_to_match_ss_score, pdb_to_surface_expose_score,
-    pdb_to_globularity_score, set_diversity,
-)
+from ab_af2_reward import AbAF2RewardCal
+from reward import set_diversity
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 ALPHABET = 'ACDEFGHIKLMNPQRSTVWYX'
 
 current_datetime = datetime.datetime.now()
-
-
-class AbRewardCal:
-    """Reward calculator for antibody CDR design.
-
-    Extends the pattern from refinement.py's RewardCal with CDR-aware metrics
-    and optional complex prediction for binder design (ipTM).
-    """
-
-    def __init__(
-        self,
-        metrics_name,
-        metrics_list,
-        esm_model,
-        device,
-        cdr_indices=None,
-        run_name="",
-        pdb_save_path="ab_sc_tmp",
-        antigen_seq=None,
-    ):
-        self.metrics_name = metrics_name.split(",")
-        metrics_list = metrics_list.split(",")
-        self.metrics_list = [float(x) for x in metrics_list]
-        assert len(self.metrics_name) == len(self.metrics_list), (
-            f"Mismatch: {len(self.metrics_name)} metric names vs {len(self.metrics_list)} weights"
-        )
-
-        self.cdr_indices = cdr_indices if cdr_indices is not None else []
-        self.pdb_save_path = pdb_save_path
-        self.run_name = run_name
-
-        # Antigen sequence for complex prediction (binder design)
-        self.antigen_seq = antigen_seq
-        self.needs_complex = 'iptm' in self.metrics_name
-        if self.needs_complex and self.antigen_seq is None:
-            raise ValueError(
-                "Metric 'iptm' requires an antigen sequence. "
-                "Provide --antigen_pdb to specify the antigen structure."
-            )
-
-        # Initialize ESMFold
-        self.folding_model = esm.pretrained.esmfold_v1().eval()
-        self.folding_model = self.folding_model.to(device)
-
-    def _run_complex_prediction(self, ab_sequences):
-        """Run ESMFold on antibody:antigen complex for ipTM computation.
-
-        Args:
-            ab_sequences: List of antibody sequence strings.
-
-        Returns:
-            complex_output: ESMFold output dict for the complex.
-        """
-        # ESMFold multimer input: chains separated by ':'
-        complex_inputs = [f"{ab_seq}:{self.antigen_seq}" for ab_seq in ab_sequences]
-        complex_output = self.folding_model.infer(complex_inputs)
-        return complex_output
-
-    def metrics_cal(self, metrics_name, ori_pdb_file=None, gen_pdb_file=None,
-                    folding_results=None, complex_results=None,
-                    protein_idx=0, save_pdb=False,
-                    pdb_raw=None, sequence_str=None):
-        """Calculate each requested metric."""
-        all_results = []
-        for metric in metrics_name:
-            if metric == 'ptm':
-                r = esm_to_ptm(folding_results, idx=protein_idx)
-            elif metric == 'plddt':
-                r = esm_to_plddt(folding_results, idx=protein_idx)
-            elif metric == 'cdr_plddt':
-                r = esm_to_cdr_plddt(folding_results, self.cdr_indices, idx=protein_idx)
-            elif metric == 'iptm':
-                ab_len = len(sequence_str)
-                ag_len = len(self.antigen_seq)
-                r = esm_to_iptm(complex_results, ab_len, ag_len, idx=protein_idx)
-            elif metric == 'charge_balance':
-                r = cdr_charge_score(sequence_str, self.cdr_indices) if sequence_str else 0.0
-            elif metric == 'cdr_hydrophobicity':
-                from io import StringIO
-                pdb_input = gen_pdb_file if save_pdb else StringIO(gen_pdb_file)
-                r = cdr_hydrophobicity_score(pdb_input, self.cdr_indices)
-            elif metric == 'tm':
-                r = pdb_to_tm(ori_pdb_file, pdb_raw)
-            elif metric == 'crmsd':
-                r = pdb_to_crmsd(ori_pdb_file, pdb_raw)
-            elif metric == 'hydrophobic':
-                from io import StringIO
-                r = pdb_to_hydrophobic_score(gen_pdb_file if save_pdb else StringIO(gen_pdb_file))
-            elif metric == 'match_ss':
-                from io import StringIO
-                seq_len = len(sequence_str) if sequence_str else 0
-                r, _ = pdb_to_match_ss_score(ori_pdb_file, gen_pdb_file if save_pdb else StringIO(gen_pdb_file), 1, seq_len + 1)
-            elif metric == 'surface_expose':
-                from io import StringIO
-                r = pdb_to_surface_expose_score(gen_pdb_file if save_pdb else StringIO(gen_pdb_file))
-            elif metric == 'globularity':
-                from io import StringIO
-                r = pdb_to_globularity_score(gen_pdb_file if save_pdb else StringIO(gen_pdb_file))
-            else:
-                raise NotImplementedError(f"Metric '{metric}' not implemented for antibody design.")
-            all_results.append(r)
-        return all_results
-
-    def reward_metrics(self, protein_name, mask_for_loss, S_sp, ori_pdb_file,
-                       save_pdb=False, add_info=""):
-        """Compute reward from folded structures. Follows refinement.py RewardCal pattern."""
-        sc_output_dir = os.path.join(self.pdb_save_path, self.run_name)
-        os.makedirs(sc_output_dir, exist_ok=True)
-        esm_input_data = []
-
-        for _it, ssp in enumerate(S_sp):
-            seq_string = "".join([
-                ALPHABET[x] for _ix, x in enumerate(ssp)
-                if mask_for_loss[_it][_ix] == 1
-            ])
-            esm_input_data.append(seq_string)
-
-        # ESMFold forward (monomer -- antibody only)
-        output = self.folding_model.infer(esm_input_data)
-        pdbs = self.folding_model.output_to_pdb(output)
-
-        # Complex prediction (antibody:antigen) if ipTM is needed
-        complex_output = None
-        if self.needs_complex:
-            complex_output = self._run_complex_prediction(esm_input_data)
-
-        # Reward calculation
-        record_reward, record_reward_agg = [], []
-        for _it, pdb in enumerate(pdbs):
-            if save_pdb:
-                pdb_path = os.path.join(sc_output_dir, f"{protein_name}{_it}_{add_info}.pdb")
-                with open(pdb_path, "w") as ff:
-                    ff.write(pdb)
-                fasta_path = os.path.join(sc_output_dir, f"{protein_name}{_it}_{add_info}.fasta")
-                with open(fasta_path, 'w') as f:
-                    f.write(f">{protein_name}\n{esm_input_data[_it]}\n")
-                # Also save complex PDB if available
-                if self.needs_complex:
-                    complex_pdbs = self.folding_model.output_to_pdb(complex_output)
-                    complex_pdb_path = os.path.join(
-                        sc_output_dir, f"{protein_name}{_it}_{add_info}_complex.pdb"
-                    )
-                    with open(complex_pdb_path, "w") as ff:
-                        ff.write(complex_pdbs[_it])
-            else:
-                pdb_path = pdb
-
-            all_reward = self.metrics_cal(
-                metrics_name=self.metrics_name,
-                gen_pdb_file=pdb_path,
-                ori_pdb_file=ori_pdb_file,
-                folding_results=output,
-                complex_results=complex_output,
-                protein_idx=_it,
-                save_pdb=save_pdb,
-                pdb_raw=pdb,
-                sequence_str=esm_input_data[_it],
-            )
-            aggregate_reward = sum(v * w for v, w in zip(all_reward, self.metrics_list))
-            record_reward_agg.append(aggregate_reward)
-            record_reward.append(all_reward)
-
-        return record_reward, record_reward_agg, 0.0
 
 
 if __name__ == "__main__":
@@ -293,15 +124,20 @@ if __name__ == "__main__":
     # ---- Initialize reward model ----
     ori_pdb_file_path = args.ref_pdb  # Can be None if not using structural comparison metrics
 
-    ab_reward_model = AbRewardCal(
+    ab_reward_model = AbAF2RewardCal(
         metrics_name=args.metrics_name,
         metrics_list=args.metrics_list,
-        esm_model=args.esm_model,
         run_name=args.run_name,
         pdb_save_path=folder_path,
         device=device,
         cdr_indices=cdr_indices,
+        antigen_pdb=args.antigen_pdb,
+        antigen_chain=args.antigen_chain,
         antigen_seq=antigen_seq,
+        af_params_dir=args.af_params_dir,
+        num_recycles=args.num_recycles,
+        af_models=tuple(int(x) for x in args.af_models.split(",")),
+        use_multimer=args.af_use_multimer,
     )
 
     reward_name_list = ab_reward_model.metrics_name
@@ -365,15 +201,20 @@ if __name__ == "__main__":
             eval_metrics_name += f",{extra}"
             eval_metrics_list += ",1"
 
-    eval_reward_model = AbRewardCal(
+    eval_reward_model = AbAF2RewardCal(
         metrics_name=eval_metrics_name,
         metrics_list=eval_metrics_list,
-        esm_model=args.esm_model,
         run_name=args.run_name,
         pdb_save_path=folder_path,
         device=device,
         cdr_indices=cdr_indices,
+        antigen_pdb=args.antigen_pdb,
+        antigen_chain=args.antigen_chain,
         antigen_seq=antigen_seq,
+        af_params_dir=args.af_params_dir,
+        num_recycles=args.num_recycles,
+        af_models=tuple(int(x) for x in args.af_models.split(",")),
+        use_multimer=args.af_use_multimer,
     )
 
     eval_reward_names = eval_reward_model.metrics_name

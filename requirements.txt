@@ -5,7 +5,7 @@ fair-esm
 lmdb
 matplotlib
 mdanalysis
-numpy
+numpy<2
 pandas
 pdb-tools
 requests
@@ -23,3 +23,15 @@ dm-tree
 ml_collections
 deepspeed
 anarci
+
+# ---- AlphaFold2 backend (replaces ESMFold for structure-based reward) ----
+# colabdesign provides the mk_afdesign_model API and bundles its own copy of
+# alphafold; pinned to the same commit used by mber-open for compatibility.
+colabdesign @ git+https://github.com/sokrypton/ColabDesign.git@d024c4e
+# JAX must match the colabdesign-pinned version; flax is constrained for the
+# same reason. Use jax[cuda12] on a CUDA host; on CPU/macOS swap to plain jax.
+jax==0.5.2
+flax<0.10.0
+# Required for AF2 PDB output / atom utilities.
+dm-tree
+ml_collections
