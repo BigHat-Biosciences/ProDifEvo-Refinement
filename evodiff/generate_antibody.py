@@ -79,7 +79,8 @@ def generate_oaardm_cdr_edit(
 
     sample = _enforce_framework(sample)
 
-    for ttt in tqdm(range(iteration), desc="Refinement iterations"):
+    pbar = tqdm(range(iteration), desc="Refinement iterations")
+    for ttt in pbar:
 
         # Determine positions to unmask this iteration
         if ttt == 0:
@@ -177,6 +178,7 @@ def generate_oaardm_cdr_edit(
                             for m in range(len(metric_names))]
         metric_summary = ", ".join(f"{n}={v:.4f}" for n, v in zip(metric_names, per_metric_means))
         print(f"Iteration {ttt}: agg={mean_agg:.4f}, {metric_summary}")
+        pbar.set_postfix_str(f"agg={mean_agg:.3f}, {metric_summary}")
 
         # Return on final iteration
         if ttt == iteration - 1:

@@ -46,11 +46,33 @@ the `cuda12` extras to the already-pinned `jax==0.5.2`):
 pip install "jax[cuda12]==0.5.2"
 ```
 
+ANARCI (used for CDR numbering when `--auto_number` is True, the default)
+shells out to the `hmmscan` binary from the HMMER suite, which is not pulled
+in by pip. Install it via bioconda:
+
+```bash
+conda install -c bioconda hmmer -y
+```
+
 PyRosetta is only needed for structural metrics (`tm`, `crmsd`, `hydrophobic`,
 `match_ss`, `surface_expose`, `globularity`, `cdr_hydrophobicity`); pure
 confidence-metric runs (`plddt`, `cdr_plddt`, `ptm`, `iptm`) don't import it.
-PyRosetta is not on PyPI — if you need it, install separately from
-https://www.pyrosetta.org/downloads (academic/commercial license required).
+
+PyRosetta is not on PyPI and requires a RosettaCommons license (free for
+academic use; register at https://www.pyrosetta.org/downloads). Install via
+`pyrosetta-installer`, which auto-detects platform and pulls the matching
+wheel:
+
+```bash
+pip install pyrosetta-installer
+python -c "import pyrosetta_installer; pyrosetta_installer.install_pyrosetta()"
+# verify:
+python -c "import pyrosetta; pyrosetta.init(); print('ok')"
+```
+
+The first run prompts for your RosettaCommons username/password. Linux x86_64
+is supported (Ubuntu, Amazon Linux 2, Amazon Linux 2023); arm64/Graviton has
+no official wheel.
 
 ### 2. AF2 weights
 
