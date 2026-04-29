@@ -18,26 +18,63 @@ with the AF2 binder protocol; otherwise the antibody monomer is hallucinated.
 
 ### 1. Python env
 
+The original `RERD` conda env from `README.md` was built on py3.9 for the
+ESMFold backend. The AF2 backend pins `jax==0.5.2`, which requires py≥3.10, so
+the env needs to be (re)created on py3.11. If `RERD` already exists at py3.9,
+remove it first with `conda env remove -n RERD`.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate   # py3.11 recommended
+conda create -n RERD python=3.11 -y
+conda activate RERD
+pip install torch torchvision torchaudio
 pip install -r requirements.txt
 ```
 
-On a CUDA host, swap the jax line for `jax[cuda12]==0.5.2`. PyRosetta is only
-needed for structural metrics (`tm`, `crmsd`, `hydrophobic`, `match_ss`,
-`surface_expose`, `globularity`, `cdr_hydrophobicity`); pure
+The torch install must come before `requirements.txt` so that `deepspeed`,
+`fair-esm`, and `torch_geometric` resolve against a known torch version rather
+than pulling whatever default the resolver picks. On a CUDA host, install the
+CUDA-matched torch wheel from the pytorch index instead, e.g. for CUDA 12.1:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+Then install the CUDA-enabled jax wheel after `requirements.txt` (this adds
+the `cuda12` extras to the already-pinned `jax==0.5.2`):
+
+```bash
+pip install "jax[cuda12]==0.5.2"
+```
+
+PyRosetta is only needed for structural metrics (`tm`, `crmsd`, `hydrophobic`,
+`match_ss`, `surface_expose`, `globularity`, `cdr_hydrophobicity`); pure
 confidence-metric runs (`plddt`, `cdr_plddt`, `ptm`, `iptm`) don't import it.
+PyRosetta is not on PyPI — if you need it, install separately from
+https://www.pyrosetta.org/downloads (academic/commercial license required).
 
 ### 2. AF2 weights
 
-The AF2 backend looks in `~/.mber/af_params` by default. Pull weights with the
-script that ships with the vendored `mber-open` checkout:
+The AF2 backend looks in `~/.mber/af_params` by default. The minimal path is a
+direct download of just the AF2 params (~3.5GB):
 
 ```bash
-bash mber-open/download_weights.sh ~/.mber       # only step [1/4] is required
+mkdir -p ~/.mber/af_params
+cd ~/.mber/af_params
+wget https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
+tar -xf alphafold_params_2022-12-06.tar && rm alphafold_params_2022-12-06.tar
 ```
 
-Override the location with `--af_params_dir` or `AF_PARAMS_DIR`.
+Alternatively, the vendored `mber-open/download_weights.sh` script pulls AF2
+**plus** NanoBodyBuilder2 and ESM2 weights (the latter ~5GB). This repo only
+uses the AF2 weights, so prefer the direct download above. If you do use the
+script, pass `--skip-esm` to skip the ESM2 download:
+
+```bash
+bash mber-open/download_weights.sh ~/.mber --skip-esm
+```
+
+Override the params location at runtime with `--af_params_dir` or the
+`AF_PARAMS_DIR` env var.
 
 ### 3. Verify
 
