@@ -14,6 +14,12 @@ For each candidate sequence in a batch, AF2 is run sequentially (no batching).
 When `iptm` is in `--metrics_name`, the antibody:antigen complex is predicted
 with the AF2 binder protocol; otherwise the antibody monomer is hallucinated.
 
+Optionally, with `--use_template` the antibody is pre-folded each candidate
+with NanoBodyBuilder2 and the combined antigen+antibody PDB is fed to AF2 as
+a binder-side template (backbone only; sequence and sidechains are still
+re-predicted). This mirrors the templating approach in `mber-open` and gives
+AF2 a structural prior on the binder fold instead of fully hallucinating it.
+
 ## Setup
 
 ### 1. Python env
@@ -98,6 +104,21 @@ bash mber-open/download_weights.sh ~/.mber --skip-esm
 Override the params location at runtime with `--af_params_dir` or the
 `AF_PARAMS_DIR` env var.
 
+#### NBB2 weights (only for `--use_template`)
+
+If you want to run with `--use_template`, also fetch NanoBodyBuilder2 weights
+(~hundreds of MB) into `~/.mber/nbb2_weights`. The vendored script handles
+this in step `[2/4]`:
+
+```bash
+bash mber-open/download_weights.sh ~/.mber --skip-esm
+# Ctrl+C after step [2/4] completes; AF2 step [1/4] also runs but is harmless if already done.
+```
+
+Override the location at runtime with `--nbb2_weights_dir` or the
+`NBB2_WEIGHTS_DIR` env var. Also `pip install ImmuneBuilder` if it wasn't
+pulled by `requirements.txt`.
+
 ### 3. Verify
 
 Required files in `$AF_PARAMS_DIR` after the download:
@@ -178,6 +199,13 @@ python ab_refinement.py \
 | `--af_use_multimer` | `True` | Use multimer params (required for `iptm`). |
 | `--af_no_multimer` | – | Disable multimer mode. |
 
+### NBB2 binder templating (optional)
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--use_template` | off | Pre-fold the antibody with NBB2 each candidate and feed the combined antigen+antibody PDB to AF2 as a binder-side template. Requires `iptm` in `--metrics_name`. |
+| `--nbb2_weights_dir` | `$NBB2_WEIGHTS_DIR` or `~/.mber/nbb2_weights` | Where NBB2 weights live. |
+
 ### Reward / decoding
 
 | flag | meaning |
@@ -219,3 +247,7 @@ containing:
   ensemble only for the final evaluation pass, not during refinement.
 - ipTM only makes sense with `--af_use_multimer`. Don't pass `--af_no_multimer`
   if `iptm` is in `--metrics_name`.
+- `--use_template` adds an NBB2 fold (~1s) and an AF2 `_prep_binder` re-call
+  per candidate. Expect ~1.5–2× slowdown vs the no-template path. The AF2 JIT
+  compile cost is still amortized across candidates since `binder_len` is
+  constant within a run.

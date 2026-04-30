@@ -107,5 +107,20 @@ def get_ab_args():
         help="Disable AF2 multimer mode (use monomer params).",
     )
 
+    # ---- NBB2 binder templating ----
+    argparser.add_argument(
+        "--use_template", action="store_true", default=False,
+        help="Pre-fold the antibody with NanoBodyBuilder2 each candidate and feed the "
+             "combined antigen+antibody PDB as a binder-side template to AF2. "
+             "Only valid when 'iptm' is in --metrics_name. Adds NBB2 fold + AF2 re-prep "
+             "latency per candidate, but improves binder backbone realism.",
+    )
+    argparser.add_argument(
+        "--nbb2_weights_dir", type=str, default=None,
+        help="Path to NanoBodyBuilder2 weights directory. If None, falls back to "
+             "$NBB2_WEIGHTS_DIR or ~/.mber/nbb2_weights. Get weights via "
+             "mber-open/download_weights.sh (step [2/4]).",
+    )
+
     args = argparser.parse_args()
     return args

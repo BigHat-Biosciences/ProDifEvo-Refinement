@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import logging
+import tempfile
 from io import StringIO
 from typing import List, Optional, Sequence
 
@@ -32,6 +33,7 @@ import numpy as np
 # fail on environments where AF2 is not yet installed. Defer to first use.
 _AF_FACTORY = None
 _CLEAR_MEM = None
+_NBB2_CLS = None
 
 
 def _lazy_import_colabdesign():
@@ -52,7 +54,61 @@ def _lazy_import_colabdesign():
     return _AF_FACTORY, _CLEAR_MEM
 
 
+def _lazy_import_nbb2():
+    """Import NanoBodyBuilder2 on first use."""
+    global _NBB2_CLS
+    if _NBB2_CLS is not None:
+        return _NBB2_CLS
+    try:
+        from ImmuneBuilder import NanoBodyBuilder2
+    except ImportError as e:
+        raise ImportError(
+            "ImmuneBuilder is required for --use_template (NanoBodyBuilder2 binder pre-folding). "
+            "Install with: pip install ImmuneBuilder"
+        ) from e
+    _NBB2_CLS = NanoBodyBuilder2
+    return _NBB2_CLS
+
+
 ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
+
+
+def _combine_target_and_binder_pdb(
+    target_pdb_path: str,
+    binder_pdb_str: str,
+    target_chain: str,
+    binder_chain: str = "H",
+) -> str:
+    """Concatenate target ATOMs and binder ATOMs into a single multi-chain PDB string.
+
+    Vendored from mber-open's pdb_utils.combine_structures, simplified to operate
+    on a target PDB path + a binder PDB string. The binder chain is rewritten to
+    ``binder_chain`` (default 'H'); the target keeps its existing chain ID.
+    """
+    with open(target_pdb_path, "r") as f:
+        target_pdb = f.read()
+
+    lines = ["HEADER    PROTEIN", "TITLE     COMBINED TARGET+BINDER (NBB2 TEMPLATE)"]
+    atom_count = 1
+
+    for line in target_pdb.splitlines():
+        if line.startswith("ATOM"):
+            lines.append(f"ATOM  {atom_count:5d}{line[11:]}")
+            atom_count += 1
+    lines.append(f"TER   {atom_count:5d}      {target_chain}")
+
+    binder_atoms = 0
+    for line in binder_pdb_str.splitlines():
+        if line.startswith("ATOM"):
+            # Force the binder chain ID to `binder_chain` (column 22, 0-indexed 21).
+            new_line = f"ATOM  {atom_count:5d}{line[11:21]}{binder_chain}{line[22:]}"
+            lines.append(new_line)
+            atom_count += 1
+            binder_atoms += 1
+    if binder_atoms > 0:
+        lines.append(f"TER   {atom_count:5d}      {binder_chain}")
+    lines.append("END")
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -148,6 +204,8 @@ class AbAF2RewardCal:
         num_recycles: int = 3,
         af_models: Sequence[int] = (0,),
         use_multimer: bool = True,
+        use_template: bool = False,
+        nbb2_weights_dir: Optional[str] = None,
         # ignored kwargs for backward compat with old call sites
         esm_model: Optional[str] = None,
     ):
@@ -182,12 +240,31 @@ class AbAF2RewardCal:
         self.af_models = list(af_models)
         self.use_multimer = use_multimer
 
+        # NBB2 templating: per-candidate NBB2 fold of the antibody is fed to
+        # AF2's binder protocol as a binder-side template (backbone only).
+        self.use_template = bool(use_template)
+        if self.use_template and not self.needs_complex:
+            raise ValueError(
+                "--use_template requires complex prediction (i.e. 'iptm' in --metrics_name). "
+                "Templating is only meaningful when an antigen is present."
+            )
+        self.nbb2_weights_dir = os.path.expanduser(
+            nbb2_weights_dir
+            or os.environ.get("NBB2_WEIGHTS_DIR", "~/.mber/nbb2_weights")
+        )
+        # Binder chain to use in the combined template PDB. NBB2 emits chain 'H'
+        # for nanobody heavy chain; we keep that for clarity.
+        self._binder_chain = "H"
+
         # Lazy-initialised colabdesign model handles
         self._complex_model = None
         self._monomer_model = None
         self._complex_target_len = 0   # number of antigen residues in the complex
         self._complex_binder_len = 0   # antibody length the complex was prepped for
         self._monomer_len = 0          # antibody length the monomer was prepped for
+
+        # Lazy NBB2 model handle (only built if use_template).
+        self._nbb2_model = None
 
     # --------------------------------------------------------
     # Model construction
@@ -244,10 +321,82 @@ class AbAF2RewardCal:
             self._monomer_model._prep_hallucination(length=ab_len)
             self._monomer_len = ab_len
 
+    def _ensure_nbb2(self) -> None:
+        """Lazy-build the NBB2 model on first use."""
+        if self._nbb2_model is not None:
+            return
+        NBB2 = _lazy_import_nbb2()
+        os.makedirs(self.nbb2_weights_dir, exist_ok=True)
+        logging.info(f"[NBB2] Loading NanoBodyBuilder2 from {self.nbb2_weights_dir}")
+        self._nbb2_model = NBB2(numbering_scheme="raw", weights_dir=self.nbb2_weights_dir)
+
+    def _ensure_templated_complex_model(self, ab_len: int, template_pdb_path: str) -> None:
+        """(Re-)prep the binder model with a fresh combined target+binder template.
+
+        Unlike ``_ensure_complex_model``, this re-runs ``_prep_binder`` every call
+        because the binder template is sequence-dependent. The colabdesign model
+        instance is reused so JAX compilation is amortized across candidates of
+        the same ab_len.
+        """
+        mk_model, clear_mem = _lazy_import_colabdesign()
+        if self._complex_model is None or self._complex_binder_len != ab_len:
+            if self._complex_model is not None:
+                clear_mem()
+            logging.info(
+                f"[AF2] Building binder/multimer model with template support "
+                f"(params={self.af_params_dir}, recycles={self.num_recycles}, ab_len={ab_len})"
+            )
+            self._complex_model = mk_model(
+                protocol="binder",
+                debug=False,
+                data_dir=self.af_params_dir,
+                use_multimer=self.use_multimer,
+                num_recycles=self.num_recycles,
+            )
+            self._complex_binder_len = ab_len
+
+        # Re-prep against the fresh combined PDB. Keep binder backbone template
+        # (rm_binder=False), strip binder seq + sidechains so AF2 re-predicts them.
+        self._complex_model._prep_binder(
+            pdb_filename=template_pdb_path,
+            chain=self.antigen_chain,
+            binder_chain=self._binder_chain,
+            hotspot=None,
+            seed=0,
+            rm_target=False,
+            rm_target_seq=False,
+            rm_target_sc=False,
+            rm_template_ic=True,
+            rm_binder=False,
+            rm_binder_seq=True,
+            rm_binder_sc=True,
+        )
+        self._complex_target_len = int(self._complex_model._target_len)
+
     # --------------------------------------------------------
     # Prediction
     # --------------------------------------------------------
+    def _fold_binder_with_nbb2(self, ab_seq: str) -> str:
+        """Fold antibody sequence with NBB2 and return the PDB as a string."""
+        self._ensure_nbb2()
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            import torch
+            with torch.no_grad():
+                nb = self._nbb2_model.predict({"H": ab_seq})
+            nb.save(tmp_path)
+            with open(tmp_path, "r") as f:
+                return f.read()
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
     def _predict_complex(self, ab_seq: str) -> dict:
+        if self.use_template:
+            return self._predict_complex_templated(ab_seq)
         self._ensure_complex_model(len(ab_seq))
         self._complex_model.predict(seq=ab_seq, models=self.af_models, verbose=False)
         # Pull a shallow copy so downstream mutations don't poison the model state.
@@ -255,6 +404,36 @@ class AbAF2RewardCal:
         aux["log"] = dict(self._complex_model.aux.get("log", {}))
         aux["_pdb_str"] = self._complex_model.save_pdb()
         return aux
+
+    def _predict_complex_templated(self, ab_seq: str) -> dict:
+        """NBB2-fold the antibody, combine with antigen, and predict the complex.
+
+        Per-candidate flow (each adds NBB2 fold + AF2 re-prep latency on top of
+        the AF2 forward pass): NBB2(ab_seq) → combined PDB → _prep_binder →
+        predict.
+        """
+        binder_pdb_str = self._fold_binder_with_nbb2(ab_seq)
+        combined_pdb_str = _combine_target_and_binder_pdb(
+            target_pdb_path=self.antigen_pdb,
+            binder_pdb_str=binder_pdb_str,
+            target_chain=self.antigen_chain,
+            binder_chain=self._binder_chain,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tmp:
+            tmp.write(combined_pdb_str)
+            combined_path = tmp.name
+        try:
+            self._ensure_templated_complex_model(len(ab_seq), combined_path)
+            self._complex_model.predict(seq=ab_seq, models=self.af_models, verbose=False)
+            aux = dict(self._complex_model.aux)
+            aux["log"] = dict(self._complex_model.aux.get("log", {}))
+            aux["_pdb_str"] = self._complex_model.save_pdb()
+            return aux
+        finally:
+            try:
+                os.remove(combined_path)
+            except OSError:
+                pass
 
     def _predict_monomer(self, ab_seq: str) -> dict:
         self._ensure_monomer_model(len(ab_seq))

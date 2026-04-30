@@ -138,6 +138,8 @@ if __name__ == "__main__":
         num_recycles=args.num_recycles,
         af_models=tuple(int(x) for x in args.af_models.split(",")),
         use_multimer=args.af_use_multimer,
+        use_template=args.use_template,
+        nbb2_weights_dir=args.nbb2_weights_dir,
     )
 
     reward_name_list = ab_reward_model.metrics_name
@@ -215,6 +217,8 @@ if __name__ == "__main__":
         num_recycles=args.num_recycles,
         af_models=tuple(int(x) for x in args.af_models.split(",")),
         use_multimer=args.af_use_multimer,
+        use_template=args.use_template,
+        nbb2_weights_dir=args.nbb2_weights_dir,
     )
 
     eval_reward_names = eval_reward_model.metrics_name

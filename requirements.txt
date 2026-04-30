@@ -35,3 +35,7 @@ flax<0.10.0
 # Required for AF2 PDB output / atom utilities.
 dm-tree
 ml_collections
+
+# ---- Optional: NanoBodyBuilder2 binder pre-folding for AF2 templating ----
+# Only needed when running with --use_template. Provides ImmuneBuilder.NanoBodyBuilder2.
+ImmuneBuilder
