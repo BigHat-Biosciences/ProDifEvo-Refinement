@@ -143,6 +143,7 @@ if __name__ == "__main__":
         use_template=args.use_template,
         nbb2_weights_dir=args.nbb2_weights_dir,
         af_gpu_ids=[int(x) for x in args.af_gpu_ids.split(",") if x.strip()],
+        seed_sequence=antibody_seq,
     )
 
     reward_name_list = ab_reward_model.metrics_name
@@ -223,6 +224,7 @@ if __name__ == "__main__":
         use_template=args.use_template,
         nbb2_weights_dir=args.nbb2_weights_dir,
         af_gpu_ids=[int(x) for x in args.af_gpu_ids.split(",") if x.strip()],
+        seed_sequence=antibody_seq,
     )
 
     eval_reward_names = eval_reward_model.metrics_name
