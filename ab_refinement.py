@@ -229,6 +229,10 @@ if __name__ == "__main__":
 
     eval_reward_names = eval_reward_model.metrics_name
 
+    # Defensive: pin tokenized_sample back to the diffusion device. The reward
+    # path can leak torch.cuda.current_device() changes across the boundary.
+    tokenized_sample = tokenized_sample.to(device)
+
     # Compute model likelihood
     likelihood_reward = likelihood(model, tokenizer, seq_len, tokenized_sample, repeat_num, device)
 

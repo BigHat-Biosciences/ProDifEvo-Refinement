@@ -825,6 +825,17 @@ class AbAF2RewardCal:
                 sc_output_dir=sc_output_dir,
             )
         finally:
+            # JAX device pinning (with jax.default_device(devices[3])) and NBB2's
+            # internal torch ops both call cudaSetDevice as a side effect, leaving
+            # torch.cuda.current_device() pointing at whichever GPU the AF worker
+            # last touched. Restore to 0 here so the diffusion model's subsequent
+            # forward passes don't allocate fresh tensors on the wrong device.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(0)
+            except Exception:
+                pass
             self._timings["reward_seconds"] += time.perf_counter() - t0
             self._timings["n_sequences"] += n_seqs_this_call
             self._timings["n_calls"] += 1
