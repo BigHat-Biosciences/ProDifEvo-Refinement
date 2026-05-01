@@ -20,6 +20,12 @@ a binder-side template (backbone only; sequence and sidechains are still
 re-predicted). This mirrors the templating approach in `mber-open` and gives
 AF2 a structural prior on the binder fold instead of fully hallucinating it.
 
+On a multi-GPU host (e.g. g5.12xlarge with 4× A10G), `--af_gpu_ids 1,2,3`
+spreads AF predictions across GPUs 1/2/3 via a `ThreadPoolExecutor` of
+device-pinned workers; GPU 0 stays dedicated to torch (diffusion model +
+NBB2). Sequences are sharded round-robin across workers and reassembled in
+order. ~2.5–3× speedup vs single-GPU on the AF portion.
+
 ## Setup
 
 ### 1. Python env
@@ -119,6 +125,14 @@ Override the location at runtime with `--nbb2_weights_dir` or the
 `NBB2_WEIGHTS_DIR` env var. Also `pip install ImmuneBuilder` if it wasn't
 pulled by `requirements.txt`.
 
+`ImmuneBuilder.refine` imports `pdbfixer` (which depends on OpenMM) at module
+load. Neither is on PyPI cleanly, so install via conda-forge — these are the
+same versions mber-open's `environment.yml` uses:
+
+```bash
+conda install -c conda-forge "openmm>=8.4.0" "pdbfixer>=1.12" -y
+```
+
 ### 3. Verify
 
 Required files in `$AF_PARAMS_DIR` after the download:
@@ -152,7 +166,8 @@ CUDA_VISIBLE_DEVICES=0 python ab_refinement.py \
     --decoding SVDD_edit \
     --af_params_dir "$AF_PARAMS_DIR" \
     --num_recycles 3 \
-    --af_models 0
+    --af_models 0 \
+    --use_template
 ```
 
 ### Monomer-only design (no antigen, plddt-driven)
@@ -206,6 +221,16 @@ python ab_refinement.py \
 | `--use_template` | off | Pre-fold the antibody with NBB2 each candidate and feed the combined antigen+antibody PDB to AF2 as a binder-side template. Requires `iptm` in `--metrics_name`. |
 | `--nbb2_weights_dir` | `$NBB2_WEIGHTS_DIR` or `~/.mber/nbb2_weights` | Where NBB2 weights live. |
 
+### Multi-GPU AF (optional)
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--af_gpu_ids` | empty | Comma-separated JAX device IDs for AF predictions, e.g. `1,2,3` to keep GPU 0 for torch. Empty or single-id falls back to serial dispatch. |
+
+When using this, set `CUDA_VISIBLE_DEVICES=0,1,2,3` (or whatever exposes all
+listed GPUs) and `XLA_PYTHON_CLIENT_PREALLOCATE=false` so JAX doesn't grab
+all of GPU 0. See `run_ab_binding.sh` for a working invocation.
+
 ### Reward / decoding
 
 | flag | meaning |
@@ -251,3 +276,8 @@ containing:
   per candidate. Expect ~1.5–2× slowdown vs the no-template path. The AF2 JIT
   compile cost is still amortized across candidates since `binder_len` is
   constant within a run.
+- `--af_gpu_ids 1,2,3` typically gives ~2.5–3× wall-clock speedup on a 4-GPU
+  box vs single-GPU. The speedup applies only to the AF portion; NBB2 fold
+  (when `--use_template` is on) stays sequential on GPU 0. First-step JIT
+  compile happens on each AF GPU independently — expect the first iteration
+  to be slow, then steady-state to be fast.

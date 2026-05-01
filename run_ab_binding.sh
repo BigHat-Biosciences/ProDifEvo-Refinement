@@ -4,7 +4,15 @@
 # Default location matches mber-open's download_weights.sh: ~/.mber/af_params.
 export AF_PARAMS_DIR="${AF_PARAMS_DIR:-$HOME/.mber/af_params}"
 
-CUDA_VISIBLE_DEVICES=1 python ab_refinement.py \
+# Multi-GPU layout (g5.12xlarge: 4× A10G):
+#   GPU 0 → torch (diffusion model + NBB2 binder pre-fold)
+#   GPU 1,2,3 → AF2 prediction workers (--af_gpu_ids 1,2,3)
+# CUDA_VISIBLE_DEVICES must expose all four. JAX preallocation is disabled so
+# JAX doesn't grab all of GPU 0 — we keep that for torch.
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+python ab_refinement.py \
     --antibody_sequence "EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDRLSITIRPRYYGLDVWGQGTLVTVSS" \
     --antigen_pdb datasets/pdl1.pdb \
     --antigen_chain A \
@@ -19,4 +27,6 @@ CUDA_VISIBLE_DEVICES=1 python ab_refinement.py \
     --decoding SVDD_edit \
     --af_params_dir "$AF_PARAMS_DIR" \
     --num_recycles 3 \
-    --af_models 0
+    --af_models 0 \
+    --use_template \
+    --af_gpu_ids 1,2,3

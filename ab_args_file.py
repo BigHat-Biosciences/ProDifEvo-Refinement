@@ -122,5 +122,14 @@ def get_ab_args():
              "mber-open/download_weights.sh (step [2/4]).",
     )
 
+    # ---- Multi-GPU AF parallelism ----
+    argparser.add_argument(
+        "--af_gpu_ids", type=str, default="",
+        help="Comma-separated JAX device IDs for AF predictions, e.g. '1,2,3' to "
+             "use GPUs 1/2/3 for AF (leaving GPU 0 for torch diffusion + NBB2). "
+             "Empty/single-id falls back to serial single-GPU dispatch. "
+             "Requires CUDA_VISIBLE_DEVICES to expose all listed GPUs.",
+    )
+
     args = argparser.parse_args()
     return args

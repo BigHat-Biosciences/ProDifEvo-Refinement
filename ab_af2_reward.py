@@ -179,6 +179,156 @@ def af2_to_cdr_plddt(
 
 
 # ============================================================
+# Per-GPU AF worker for multi-GPU parallelism
+# ============================================================
+
+class _AFWorker:
+    """A single AF2 model instance pinned to one JAX device.
+
+    Each worker holds its own complex/monomer model handles. All JAX ops are
+    executed inside ``jax.default_device(jax_device)`` so that compilation and
+    forward passes are routed to that device. Workers don't share state, so a
+    pool of them can run concurrently from a ThreadPoolExecutor.
+    """
+
+    def __init__(
+        self,
+        jax_device,
+        af_params_dir: str,
+        num_recycles: int,
+        use_multimer: bool,
+        af_models: Sequence[int],
+        antigen_pdb: Optional[str],
+        antigen_chain: str,
+        binder_chain: str = "H",
+    ):
+        self.jax_device = jax_device
+        self.af_params_dir = af_params_dir
+        self.num_recycles = num_recycles
+        self.use_multimer = use_multimer
+        self.af_models = list(af_models)
+        self.antigen_pdb = antigen_pdb
+        self.antigen_chain = antigen_chain
+        self.binder_chain = binder_chain
+
+        self._complex_model = None
+        self._complex_target_len = 0
+        self._complex_binder_len = 0
+        self._complex_templated = False  # whether model was last prepped with a binder template
+        self._monomer_model = None
+        self._monomer_len = 0
+
+    def _ensure_complex_model(self, ab_len: int) -> None:
+        mk_model, clear_mem = _lazy_import_colabdesign()
+        # Rebuild if length changed OR if previous prep was templated (since
+        # the binder chain plumbing differs).
+        if (self._complex_model is None
+                or self._complex_binder_len != ab_len
+                or self._complex_templated):
+            if self._complex_model is not None:
+                clear_mem()
+            self._complex_model = mk_model(
+                protocol="binder",
+                debug=False,
+                data_dir=self.af_params_dir,
+                use_multimer=self.use_multimer,
+                num_recycles=self.num_recycles,
+            )
+            self._complex_model._prep_binder(
+                pdb_filename=self.antigen_pdb,
+                chain=self.antigen_chain,
+                binder_len=ab_len,
+                hotspot=None,
+                seed=0,
+                rm_target=False,
+                rm_target_seq=False,
+                rm_target_sc=False,
+                rm_template_ic=True,
+                rm_binder=True,
+                rm_binder_seq=True,
+                rm_binder_sc=True,
+            )
+            self._complex_binder_len = ab_len
+            self._complex_target_len = int(self._complex_model._target_len)
+            self._complex_templated = False
+
+    def _ensure_templated_complex_model(self, ab_len: int, template_pdb_path: str) -> None:
+        mk_model, clear_mem = _lazy_import_colabdesign()
+        if (self._complex_model is None
+                or self._complex_binder_len != ab_len
+                or not self._complex_templated):
+            if self._complex_model is not None:
+                clear_mem()
+            self._complex_model = mk_model(
+                protocol="binder",
+                debug=False,
+                data_dir=self.af_params_dir,
+                use_multimer=self.use_multimer,
+                num_recycles=self.num_recycles,
+            )
+            self._complex_binder_len = ab_len
+            self._complex_templated = True
+
+        # Re-prep against the fresh combined PDB. Keep binder backbone template
+        # (rm_binder=False); strip seq + sidechains so AF2 re-predicts them.
+        self._complex_model._prep_binder(
+            pdb_filename=template_pdb_path,
+            chain=self.antigen_chain,
+            binder_chain=self.binder_chain,
+            hotspot=None,
+            seed=0,
+            rm_target=False,
+            rm_target_seq=False,
+            rm_target_sc=False,
+            rm_template_ic=True,
+            rm_binder=False,
+            rm_binder_seq=True,
+            rm_binder_sc=True,
+        )
+        self._complex_target_len = int(self._complex_model._target_len)
+
+    def _ensure_monomer_model(self, ab_len: int) -> None:
+        mk_model, clear_mem = _lazy_import_colabdesign()
+        if self._monomer_model is None or self._monomer_len != ab_len:
+            if self._monomer_model is not None:
+                clear_mem()
+            self._monomer_model = mk_model(
+                protocol="hallucination",
+                use_templates=False,
+                num_recycles=self.num_recycles,
+                data_dir=self.af_params_dir,
+                use_multimer=False,
+            )
+            self._monomer_model._prep_hallucination(length=ab_len)
+            self._monomer_len = ab_len
+
+    def predict_complex(self, ab_seq: str, template_pdb_path: Optional[str] = None) -> tuple:
+        """Run a complex prediction. Returns (aux, target_len)."""
+        import jax
+        with jax.default_device(self.jax_device):
+            if template_pdb_path is not None:
+                self._ensure_templated_complex_model(len(ab_seq), template_pdb_path)
+            else:
+                self._ensure_complex_model(len(ab_seq))
+            self._complex_model.predict(seq=ab_seq, models=self.af_models, verbose=False)
+            aux = dict(self._complex_model.aux)
+            aux["log"] = dict(self._complex_model.aux.get("log", {}))
+            aux["_pdb_str"] = self._complex_model.save_pdb()
+            return aux, self._complex_target_len
+
+    def predict_monomer(self, ab_seq: str) -> dict:
+        import jax
+        with jax.default_device(self.jax_device):
+            self._ensure_monomer_model(len(ab_seq))
+            self._monomer_model.set_seq(ab_seq)
+            self._monomer_model.predict(models=self.af_models, verbose=False)
+            aux = dict(self._monomer_model.aux)
+            aux["log"] = dict(self._monomer_model.aux.get("log", {}))
+            aux["_pdb_str"] = self._monomer_model.save_pdb()
+            return aux
+
+
+# ============================================================
 # AF2 reward calculator
 # ============================================================
 
@@ -206,6 +356,7 @@ class AbAF2RewardCal:
         use_multimer: bool = True,
         use_template: bool = False,
         nbb2_weights_dir: Optional[str] = None,
+        af_gpu_ids: Optional[Sequence[int]] = None,
         # ignored kwargs for backward compat with old call sites
         esm_model: Optional[str] = None,
     ):
@@ -266,6 +417,13 @@ class AbAF2RewardCal:
         # Lazy NBB2 model handle (only built if use_template).
         self._nbb2_model = None
 
+        # Multi-GPU AF parallelism. If af_gpu_ids has 2+ device IDs, AF
+        # predictions are dispatched in parallel across one _AFWorker per GPU.
+        # If 0 or 1 device IDs, the existing serial path on the default device
+        # is used (no behavior change).
+        self.af_gpu_ids = list(af_gpu_ids) if af_gpu_ids else []
+        self._workers: List["_AFWorker"] = []  # lazy-built on first use
+
     # --------------------------------------------------------
     # Model construction
     # --------------------------------------------------------
@@ -320,6 +478,37 @@ class AbAF2RewardCal:
             # Hallucination protocol needs an explicit length; safe to call repeatedly.
             self._monomer_model._prep_hallucination(length=ab_len)
             self._monomer_len = ab_len
+
+    def _ensure_workers(self) -> None:
+        """Lazy-build a pool of _AFWorker instances pinned to ``af_gpu_ids``."""
+        if self._workers or not self.af_gpu_ids:
+            return
+        import jax
+        all_devices = jax.devices()
+        try:
+            picked = [all_devices[i] for i in self.af_gpu_ids]
+        except IndexError as e:
+            raise ValueError(
+                f"--af_gpu_ids {self.af_gpu_ids} out of range; "
+                f"jax.devices() has {len(all_devices)} devices."
+            ) from e
+        logging.info(
+            f"[AF2] Building {len(picked)} AF workers on devices "
+            f"{[str(d) for d in picked]}"
+        )
+        self._workers = [
+            _AFWorker(
+                jax_device=dev,
+                af_params_dir=self.af_params_dir,
+                num_recycles=self.num_recycles,
+                use_multimer=self.use_multimer,
+                af_models=self.af_models,
+                antigen_pdb=self.antigen_pdb,
+                antigen_chain=self.antigen_chain,
+                binder_chain=self._binder_chain,
+            )
+            for dev in picked
+        ]
 
     def _ensure_nbb2(self) -> None:
         """Lazy-build the NBB2 model on first use."""
@@ -544,6 +733,19 @@ class AbAF2RewardCal:
             )
             ab_sequences.append(seq_string)
 
+        # Multi-GPU dispatch when af_gpu_ids has 2+ devices: predict the AF
+        # forward passes in parallel across workers, then run the (CPU-bound)
+        # metric calculation step serially on the gathered results.
+        if self.af_gpu_ids and len(self.af_gpu_ids) > 1:
+            return self._reward_metrics_parallel(
+                protein_name=protein_name,
+                ab_sequences=ab_sequences,
+                ori_pdb_file=ori_pdb_file,
+                save_pdb=save_pdb,
+                add_info=add_info,
+                sc_output_dir=sc_output_dir,
+            )
+
         record_reward: List[List[float]] = []
         record_reward_agg: List[float] = []
 
@@ -574,6 +776,101 @@ class AbAF2RewardCal:
                 pdb_for_metrics: object = pdb_path
             else:
                 # Hand the raw PDB string to PDB-based metrics; they wrap it in StringIO.
+                pdb_for_metrics = pdb_str
+
+            all_reward = self.metrics_cal(
+                metrics_name=self.metrics_name,
+                complex_aux=complex_aux,
+                monomer_aux=monomer_aux,
+                ori_pdb_file=ori_pdb_file,
+                gen_pdb_file=pdb_for_metrics,
+                save_pdb=save_pdb,
+                sequence_str=ab_seq,
+                binder_offset=binder_offset,
+            )
+            agg = sum(v * w for v, w in zip(all_reward, self.metrics_list))
+            record_reward.append(all_reward)
+            record_reward_agg.append(agg)
+
+        return record_reward, record_reward_agg, 0.0
+
+    def _reward_metrics_parallel(
+        self,
+        protein_name: str,
+        ab_sequences: List[str],
+        ori_pdb_file: Optional[str],
+        save_pdb: bool,
+        add_info: str,
+        sc_output_dir: str,
+    ):
+        """Multi-GPU variant of reward_metrics. Dispatches AF predicts across workers."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._ensure_workers()
+        n_workers = len(self._workers)
+
+        # Phase 1 (templating only): NBB2-fold each sequence on the main torch
+        # device. This stays sequential — NBB2 is fast (~5s) vs AF predict
+        # (~30s) and the diffusion model wants exclusive access to GPU 0.
+        # Each entry is a temp PDB path (caller must clean up) or None.
+        template_paths: List[Optional[str]] = [None] * len(ab_sequences)
+        if self.use_template and self.needs_complex:
+            for i, ab_seq in enumerate(ab_sequences):
+                binder_pdb_str = self._fold_binder_with_nbb2(ab_seq)
+                combined_pdb_str = _combine_target_and_binder_pdb(
+                    target_pdb_path=self.antigen_pdb,
+                    binder_pdb_str=binder_pdb_str,
+                    target_chain=self.antigen_chain,
+                    binder_chain=self._binder_chain,
+                )
+                with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tmp:
+                    tmp.write(combined_pdb_str)
+                    template_paths[i] = tmp.name
+
+        # Phase 2: parallel AF predicts across workers, sharded round-robin.
+        def _task(idx: int):
+            worker = self._workers[idx % n_workers]
+            ab_seq = ab_sequences[idx]
+            if self.needs_complex:
+                aux, target_len = worker.predict_complex(
+                    ab_seq, template_pdb_path=template_paths[idx]
+                )
+                return idx, aux, None, target_len
+            else:
+                aux = worker.predict_monomer(ab_seq)
+                return idx, None, aux, 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(_task, i) for i in range(len(ab_sequences))]
+                # collect & sort by original index so results align with ab_sequences
+                results = sorted([f.result() for f in futures], key=lambda x: x[0])
+        finally:
+            # Clean up template temp files regardless of success.
+            for p in template_paths:
+                if p is not None:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+        record_reward: List[List[float]] = []
+        record_reward_agg: List[float] = []
+
+        for idx, complex_aux, monomer_aux, target_len in results:
+            ab_seq = ab_sequences[idx]
+            binder_offset = target_len if self.needs_complex else 0
+            pdb_str = (complex_aux or monomer_aux)["_pdb_str"]
+
+            pdb_path = os.path.join(sc_output_dir, f"{protein_name}{idx}_{add_info}.pdb")
+            if save_pdb:
+                with open(pdb_path, "w") as ff:
+                    ff.write(pdb_str)
+                fasta_path = os.path.join(sc_output_dir, f"{protein_name}{idx}_{add_info}.fasta")
+                with open(fasta_path, "w") as f:
+                    f.write(f">{protein_name}\n{ab_seq}\n")
+                pdb_for_metrics: object = pdb_path
+            else:
                 pdb_for_metrics = pdb_str
 
             all_reward = self.metrics_cal(
