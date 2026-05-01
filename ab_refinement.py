@@ -36,6 +36,7 @@ from evodiff.generate_antibody import generate_oaardm_cdr_edit, generate_oaardm_
 import os
 import datetime
 import logging
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -55,6 +56,7 @@ current_datetime = datetime.datetime.now()
 
 
 if __name__ == "__main__":
+    run_t0 = time.perf_counter()
     args = get_ab_args()
 
     # ---- Parse CDR / Framework boundaries ----
@@ -272,3 +274,27 @@ if __name__ == "__main__":
     for i, seq in enumerate(generated_sequence):
         cdr_only = "".join([seq[j] for j in cdr_indices])
         print(f"  [{i}] CDR: {cdr_only}")
+
+    # ---- Timing summary ----
+    run_wall = time.perf_counter() - run_t0
+    refine_t = ab_reward_model._timings
+    eval_t = eval_reward_model._timings
+    total_seqs = refine_t["n_sequences"] + eval_t["n_sequences"]
+    total_reward_s = refine_t["reward_seconds"] + eval_t["reward_seconds"]
+    avg_s_per_seq = total_reward_s / max(total_seqs, 1)
+
+    summary_lines = [
+        "=== Run timing summary ===",
+        f"Total run wall time:           {run_wall:.2f} s",
+        f"Refinement reward time:        {refine_t['reward_seconds']:.2f} s "
+        f"({refine_t['n_sequences']} sequences, {refine_t['n_calls']} calls)",
+        f"Final eval reward time:        {eval_t['reward_seconds']:.2f} s "
+        f"({eval_t['n_sequences']} sequences, {eval_t['n_calls']} calls)",
+        f"Total sequences scored:        {total_seqs}",
+        f"Avg sec/sequence (reward):     {avg_s_per_seq:.3f} s",
+        f"Per-iteration timings:         see {os.path.join(folder_path, 'timing.csv')}",
+    ]
+    print("\n" + "\n".join(summary_lines))
+    with open(os.path.join(folder_path, "timing_summary.txt"), "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    logging.info("Timing summary: %s", " | ".join(summary_lines[1:]))

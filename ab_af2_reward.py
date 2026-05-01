@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import logging
 import tempfile
+import time
 from io import StringIO
 from typing import List, Optional, Sequence
 
@@ -424,6 +425,13 @@ class AbAF2RewardCal:
         self.af_gpu_ids = list(af_gpu_ids) if af_gpu_ids else []
         self._workers: List["_AFWorker"] = []  # lazy-built on first use
 
+        # Cumulative timing/counts. Updated by reward_metrics on every call.
+        self._timings = {
+            "n_sequences": 0,        # total sequences scored
+            "reward_seconds": 0.0,   # total wall time inside reward_metrics
+            "n_calls": 0,            # number of reward_metrics invocations
+        }
+
     # --------------------------------------------------------
     # Model construction
     # --------------------------------------------------------
@@ -722,22 +730,33 @@ class AbAF2RewardCal:
             - record_reward: list of per-sequence per-metric scores (list[list[float]])
             - record_reward_agg: list of per-sequence weighted aggregates
         """
-        sc_output_dir = os.path.join(self.pdb_save_path, self.run_name)
-        os.makedirs(sc_output_dir, exist_ok=True)
+        t0 = time.perf_counter()
+        n_seqs_this_call = 0
+        try:
+            sc_output_dir = os.path.join(self.pdb_save_path, self.run_name)
+            os.makedirs(sc_output_dir, exist_ok=True)
 
-        # Decode tokens to sequence strings using the loss mask.
-        ab_sequences: List[str] = []
-        for _it, ssp in enumerate(S_sp):
-            seq_string = "".join(
-                ALPHABET[x] for _ix, x in enumerate(ssp) if mask_for_loss[_it][_ix] == 1
-            )
-            ab_sequences.append(seq_string)
+            # Decode tokens to sequence strings using the loss mask.
+            ab_sequences: List[str] = []
+            for _it, ssp in enumerate(S_sp):
+                seq_string = "".join(
+                    ALPHABET[x] for _ix, x in enumerate(ssp) if mask_for_loss[_it][_ix] == 1
+                )
+                ab_sequences.append(seq_string)
+            n_seqs_this_call = len(ab_sequences)
 
-        # Multi-GPU dispatch when af_gpu_ids has 2+ devices: predict the AF
-        # forward passes in parallel across workers, then run the (CPU-bound)
-        # metric calculation step serially on the gathered results.
-        if self.af_gpu_ids and len(self.af_gpu_ids) > 1:
-            return self._reward_metrics_parallel(
+            # Multi-GPU dispatch when af_gpu_ids has 2+ devices.
+            if self.af_gpu_ids and len(self.af_gpu_ids) > 1:
+                return self._reward_metrics_parallel(
+                    protein_name=protein_name,
+                    ab_sequences=ab_sequences,
+                    ori_pdb_file=ori_pdb_file,
+                    save_pdb=save_pdb,
+                    add_info=add_info,
+                    sc_output_dir=sc_output_dir,
+                )
+
+            return self._reward_metrics_serial(
                 protein_name=protein_name,
                 ab_sequences=ab_sequences,
                 ori_pdb_file=ori_pdb_file,
@@ -745,7 +764,21 @@ class AbAF2RewardCal:
                 add_info=add_info,
                 sc_output_dir=sc_output_dir,
             )
+        finally:
+            self._timings["reward_seconds"] += time.perf_counter() - t0
+            self._timings["n_sequences"] += n_seqs_this_call
+            self._timings["n_calls"] += 1
 
+    def _reward_metrics_serial(
+        self,
+        protein_name: str,
+        ab_sequences: List[str],
+        ori_pdb_file: Optional[str],
+        save_pdb: bool,
+        add_info: str,
+        sc_output_dir: str,
+    ):
+        """Serial single-GPU reward path. Extracted from reward_metrics for clarity."""
         record_reward: List[List[float]] = []
         record_reward_agg: List[float] = []
 

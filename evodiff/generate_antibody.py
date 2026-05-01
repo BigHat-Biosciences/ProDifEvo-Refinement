@@ -5,8 +5,10 @@ while keeping framework residues fixed.
 """
 
 import csv
+import logging
 import os
 import random
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -80,7 +82,10 @@ def generate_oaardm_cdr_edit(
     sample = _enforce_framework(sample)
 
     pbar = tqdm(range(iteration), desc="Refinement iterations")
+    timing_csv = os.path.join(folder_path, 'timing.csv')
     for ttt in pbar:
+        iter_t0 = time.perf_counter()
+        n_seqs_before = reward_model._timings["n_sequences"] if hasattr(reward_model, "_timings") else 0
 
         # Determine positions to unmask this iteration
         if ttt == 0:
@@ -179,6 +184,22 @@ def generate_oaardm_cdr_edit(
         metric_summary = ", ".join(f"{n}={v:.4f}" for n, v in zip(metric_names, per_metric_means))
         print(f"Iteration {ttt}: agg={mean_agg:.4f}, {metric_summary}")
         pbar.set_postfix_str(f"agg={mean_agg:.3f}, {metric_summary}")
+
+        # Per-iteration timing: total wall, sequences scored this iter, sec/seq.
+        iter_wall = time.perf_counter() - iter_t0
+        n_seqs_after = reward_model._timings["n_sequences"] if hasattr(reward_model, "_timings") else 0
+        n_seqs_iter = n_seqs_after - n_seqs_before
+        sec_per_seq = iter_wall / max(n_seqs_iter, 1)
+        logging.info(
+            f"Iteration {ttt} timing: wall={iter_wall:.2f}s, "
+            f"n_sequences={n_seqs_iter}, sec_per_seq={sec_per_seq:.3f}"
+        )
+        write_header_t = (ttt == 0) and not os.path.exists(timing_csv)
+        with open(timing_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header_t:
+                writer.writerow(['iteration', 'wall_seconds', 'n_sequences', 'sec_per_seq'])
+            writer.writerow([ttt, f"{iter_wall:.3f}", n_seqs_iter, f"{sec_per_seq:.3f}"])
 
         # Return on final iteration
         if ttt == iteration - 1:
