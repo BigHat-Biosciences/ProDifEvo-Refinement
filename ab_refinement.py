@@ -282,22 +282,33 @@ if __name__ == "__main__":
         print(f"  [{i}] CDR: {cdr_only}")
 
     # ---- Timing summary ----
+    # Two distinct cost metrics:
+    #   * sec_per_designed_binder = run_wall / repeat_num. The number worth quoting
+    #     for campaign planning ("how long does it take to design one binder").
+    #   * sec_per_af_prediction = total reward time / total AF prediction count.
+    #     A throughput metric ("how fast is the AF backend per call"), useful for
+    #     engineering. Note this counts every intermediate candidate scored during
+    #     refinement, which is much larger than the number of designed binders.
     run_wall = time.perf_counter() - run_t0
     refine_t = ab_reward_model._timings
     eval_t = eval_reward_model._timings
-    total_seqs = refine_t["n_sequences"] + eval_t["n_sequences"]
+    total_preds = refine_t["n_sequences"] + eval_t["n_sequences"]
     total_reward_s = refine_t["reward_seconds"] + eval_t["reward_seconds"]
-    avg_s_per_seq = total_reward_s / max(total_seqs, 1)
+    avg_s_per_pred = total_reward_s / max(total_preds, 1)
+    sec_per_designed_binder = run_wall / max(repeat_num, 1)
 
     summary_lines = [
         "=== Run timing summary ===",
         f"Total run wall time:           {run_wall:.2f} s",
+        f"Designed binders:              {repeat_num}",
+        f"Sec per designed binder:       {sec_per_designed_binder:.2f} s",
+        "",
         f"Refinement reward time:        {refine_t['reward_seconds']:.2f} s "
-        f"({refine_t['n_sequences']} sequences, {refine_t['n_calls']} calls)",
+        f"({refine_t['n_sequences']} AF predictions, {refine_t['n_calls']} batched calls)",
         f"Final eval reward time:        {eval_t['reward_seconds']:.2f} s "
-        f"({eval_t['n_sequences']} sequences, {eval_t['n_calls']} calls)",
-        f"Total sequences scored:        {total_seqs}",
-        f"Avg sec/sequence (reward):     {avg_s_per_seq:.3f} s",
+        f"({eval_t['n_sequences']} AF predictions, {eval_t['n_calls']} batched calls)",
+        f"Total AF predictions:          {total_preds}",
+        f"Avg sec per AF prediction:     {avg_s_per_pred:.3f} s",
         f"Per-iteration timings:         see {os.path.join(folder_path, 'timing.csv')}",
     ]
     print("\n" + "\n".join(summary_lines))

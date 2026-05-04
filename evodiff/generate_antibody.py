@@ -185,21 +185,23 @@ def generate_oaardm_cdr_edit(
         print(f"Iteration {ttt}: agg={mean_agg:.4f}, {metric_summary}")
         pbar.set_postfix_str(f"agg={mean_agg:.3f}, {metric_summary}")
 
-        # Per-iteration timing: total wall, sequences scored this iter, sec/seq.
+        # Per-iteration timing. n_af_predictions = total candidate sequences scored
+        # by AF this iteration (= num_inner_steps * candidate * repeat_num + repeat_num
+        # for the end-of-iter eval). Distinct from "designed binders", which is repeat_num.
         iter_wall = time.perf_counter() - iter_t0
-        n_seqs_after = reward_model._timings["n_sequences"] if hasattr(reward_model, "_timings") else 0
-        n_seqs_iter = n_seqs_after - n_seqs_before
-        sec_per_seq = iter_wall / max(n_seqs_iter, 1)
+        n_preds_after = reward_model._timings["n_sequences"] if hasattr(reward_model, "_timings") else 0
+        n_preds_iter = n_preds_after - n_seqs_before
+        sec_per_pred = iter_wall / max(n_preds_iter, 1)
         logging.info(
             f"Iteration {ttt} timing: wall={iter_wall:.2f}s, "
-            f"n_sequences={n_seqs_iter}, sec_per_seq={sec_per_seq:.3f}"
+            f"n_af_predictions={n_preds_iter}, sec_per_af_prediction={sec_per_pred:.3f}"
         )
         write_header_t = (ttt == 0) and not os.path.exists(timing_csv)
         with open(timing_csv, 'a', newline='') as f:
             writer = csv.writer(f)
             if write_header_t:
-                writer.writerow(['iteration', 'wall_seconds', 'n_sequences', 'sec_per_seq'])
-            writer.writerow([ttt, f"{iter_wall:.3f}", n_seqs_iter, f"{sec_per_seq:.3f}"])
+                writer.writerow(['iteration', 'wall_seconds', 'n_af_predictions', 'sec_per_af_prediction'])
+            writer.writerow([ttt, f"{iter_wall:.3f}", n_preds_iter, f"{sec_per_pred:.3f}"])
 
         # Return on final iteration
         if ttt == iteration - 1:

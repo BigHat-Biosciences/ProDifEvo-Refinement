@@ -17,11 +17,11 @@ python ab_refinement.py \
     --antigen_pdb datasets/pdl1.pdb \
     --antigen_chain A \
     --chain_type heavy \
-    --cdrs_to_design H3 \
+    --cdrs_to_design H1,H2,H3 \
     --numbering_scheme imgt \
     --metrics_name iptm,cdr_plddt,plddt \
     --metrics_list 3,1,1 \
-    --repeatnum 3 \
+    --repeatnum 100 \
     --duplicate 5 \
     --iteration 10 \
     --decoding SVDD_edit \
