@@ -4,9 +4,38 @@ from io import StringIO
 from biotite.structure import AtomArray
 from biotite.structure.io.pdb import PDBFile
 
-import pyrosetta.rosetta.core.pose as pose
-from pyrosetta import pose_from_pdb
-from pyrosetta.rosetta.core.import_pose import pose_from_pdbstring
+# pyrosetta is optional — only structural-metric functions in reward.py need it
+# (tm, crmsd, hydrophobic, match_ss, surface_expose, globularity,
+# cdr_hydrophobicity). Confidence-only runs (iptm/plddt/cdr_plddt) don't, and
+# the container intentionally omits pyrosetta.
+try:
+    import pyrosetta as _pyrosetta
+    import pyrosetta.rosetta.core.pose as pose
+    from pyrosetta import pose_from_pdb
+    from pyrosetta.rosetta.core.import_pose import pose_from_pdbstring
+    _PYROSETTA_AVAILABLE = True
+except ImportError:
+    _pyrosetta = None
+    pose = None
+    pose_from_pdb = None
+    pose_from_pdbstring = None
+    _PYROSETTA_AVAILABLE = False
+
+_PYROSETTA_INITIALIZED = False
+
+
+def _require_pyrosetta(fn_name: str) -> None:
+    """Raise if pyrosetta is unavailable; init it on first call."""
+    global _PYROSETTA_INITIALIZED
+    if not _PYROSETTA_AVAILABLE:
+        raise ImportError(
+            f"{fn_name} requires pyrosetta, which is not installed in this environment. "
+            "Install pyrosetta or restrict --metrics_name to confidence-only metrics "
+            "(iptm, plddt, cdr_plddt, ptm, charge_balance)."
+        )
+    if not _PYROSETTA_INITIALIZED:
+        _pyrosetta.init(options="-mute all")
+        _PYROSETTA_INITIALIZED = True
 
 
 RESIDUE_TYPES_1to3 = {"A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY",
@@ -19,6 +48,7 @@ def pose_read_pdb(pdb_file, filter_by_CA=True):
     """
     pdb file path, or, esmfold.infer_pdbs(sequence)[0]
     """
+    _require_pyrosetta("pose_read_pdb")
     assert isinstance(pdb_file, str)
     if pdb_file.endswith('.pdb'):
         pose_pdb = pose_from_pdb(pdb_file)
