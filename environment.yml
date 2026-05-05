@@ -1,0 +1,15 @@
+name: RERD
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools<82
+  # ImmuneBuilder.refine pulls these in (pdbfixer needs openmm); not on PyPI.
+  - openmm>=8.4.0
+  - pdbfixer>=1.12
+  # ANARCI shells out to hmmscan for antibody numbering.
+  - hmmer
+  # All other deps come in via pip from requirements.txt at Docker build time.
