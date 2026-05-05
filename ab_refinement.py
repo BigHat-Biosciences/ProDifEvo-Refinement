@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
     # ---- Setup ----
     folder_path = os.path.join(
-        "log",
+        args.output_root,
         f"{current_datetime}_ab_{args.decoding}_{args.metrics_name}_{args.chain_type}_{args.cdrs_to_design}",
     )
     os.makedirs(folder_path, exist_ok=True)

@@ -40,6 +40,11 @@ def get_ab_args():
 
     # ---- Shared arguments (same as refinement.py) ----
     argparser.add_argument("--run_name", type=str, default="ab_debug", help="Run name for saving results.")
+    argparser.add_argument(
+        "--output_root", type=str, default="log",
+        help="Top-level output directory. Defaults to 'log/' for local runs. "
+             "Set to '/opt/ml/processing/output' for SageMaker so artifacts upload to S3.",
+    )
     argparser.add_argument("--seed", type=int, default=0)
     argparser.add_argument("--repeatnum", type=int, default=10, help="Batch size (number of parallel designs).")
     argparser.add_argument("--duplicate", type=int, default=20, help="Number of candidates per step.")
