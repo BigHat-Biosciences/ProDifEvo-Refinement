@@ -2,16 +2,26 @@
 
 Run from a checkout of the bh-ai repo (so `bh.aicore.training.sage` is importable).
 
-Example:
+The antigen can be supplied two ways:
 
+* a name of a PDB baked into the image (currently: pdl1, bhrf1, il3, il20)
+  → no S3 transfer; the container reads /home/datasets/<name>.pdb directly.
+* an s3://... URI to a single-chain PDB
+  → mounted via ProcessingInput at /opt/ml/processing/input/antigen/antigen.pdb.
+
+Examples:
+
+    # Use the pdl1 PDB already inside the image:
     python scripts/launch_processing_job.py \\
-        --antigen-s3-uri s3://332120041740-bighat-datasets/MyData/pdl1.pdb \\
+        --antigen pdl1 \\
         --antibody-sequence "EVQLVESGGGLVQPGG..." \\
         --cdrs-to-design H1,H2,H3 \\
-        --repeatnum 100 \\
-        --iteration 10
+        --repeatnum 100
 
-Multiple jobs can be launched by editing the parameter sweep block at the bottom.
+    # Or pull from S3:
+    python scripts/launch_processing_job.py \\
+        --antigen s3://332120041740-bighat-datasets/MyData/custom.pdb \\
+        --antibody-sequence "EVQLVESGGGLVQPGG..."
 """
 
 from __future__ import annotations
@@ -33,9 +43,34 @@ CONTAINER_INPUT_DIR = "/opt/ml/processing/input/antigen"
 CONTAINER_OUTPUT_DIR = "/opt/ml/processing/output"
 CONTAINER_ANTIGEN_PDB = os.path.join(CONTAINER_INPUT_DIR, "antigen.pdb")
 
+# PDBs baked into the image at build time. Keep in sync with datasets/.
+BAKED_ANTIGENS = {"pdl1", "bhrf1", "il3", "il20"}
+BAKED_DATASETS_DIR = "/home/datasets"
+
+
+def resolve_antigen(antigen: str) -> tuple[str, Optional[ProcessingInput]]:
+    """Return (container_path_to_pdb, optional_processing_input).
+
+    If ``antigen`` is an s3:// URI, a ProcessingInput is built that mounts the
+    PDB at CONTAINER_ANTIGEN_PDB. If it's a baked name, no input is needed and
+    the path resolves to /home/datasets/<name>.pdb inside the image.
+    """
+    if antigen.startswith("s3://"):
+        return CONTAINER_ANTIGEN_PDB, ProcessingInput(
+            source=antigen,
+            destination=CONTAINER_INPUT_DIR,
+            input_name="antigen",
+        )
+    if antigen in BAKED_ANTIGENS:
+        return os.path.join(BAKED_DATASETS_DIR, f"{antigen}.pdb"), None
+    raise ValueError(
+        f"--antigen must be an s3:// URI or one of {sorted(BAKED_ANTIGENS)}; got {antigen!r}"
+    )
+
 
 def build_command(
     *,
+    antigen_container_path: str,
     antibody_sequence: str,
     cdrs_to_design: str,
     metrics_name: str,
@@ -53,7 +88,7 @@ def build_command(
     cmd = f"""
         ab_refinement.py
         --antibody_sequence {antibody_sequence}
-        --antigen_pdb {CONTAINER_ANTIGEN_PDB}
+        --antigen_pdb {antigen_container_path}
         --antigen_chain A
         --chain_type heavy
         --cdrs_to_design {cdrs_to_design}
@@ -78,7 +113,7 @@ def build_command(
 
 def launch_one(
     *,
-    antigen_s3_uri: str,
+    antigen: str,
     antibody_sequence: str,
     cdrs_to_design: str = "H1,H2,H3",
     metrics_name: str = "iptm,cdr_plddt,plddt",
@@ -94,13 +129,8 @@ def launch_one(
     image_tag: str = "latest",
     timeout_hours: int = 24,
 ):
-    inputs = [
-        ProcessingInput(
-            source=antigen_s3_uri,
-            destination=CONTAINER_INPUT_DIR,
-            input_name="antigen",
-        ),
-    ]
+    antigen_path, antigen_input = resolve_antigen(antigen)
+    inputs = [antigen_input] if antigen_input is not None else []
     outputs = [
         ProcessingOutput(
             output_name="rerd_output",
@@ -109,6 +139,7 @@ def launch_one(
         ),
     ]
     cmd = build_command(
+        antigen_container_path=antigen_path,
         antibody_sequence=antibody_sequence,
         cdrs_to_design=cdrs_to_design,
         metrics_name=metrics_name,
@@ -136,8 +167,9 @@ def launch_one(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--antigen-s3-uri", required=True,
-                   help="s3://... path to a single-chain antigen PDB.")
+    p.add_argument("--antigen", required=True,
+                   help=f"Either an s3:// URI to a PDB, or a baked-in name "
+                        f"({sorted(BAKED_ANTIGENS)}).")
     p.add_argument("--antibody-sequence", required=True,
                    help="Full heavy-chain antibody sequence to seed design from.")
     p.add_argument("--cdrs-to-design", default="H1,H2,H3")
@@ -153,7 +185,7 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     launch_one(
-        antigen_s3_uri=args.antigen_s3_uri,
+        antigen=args.antigen,
         antibody_sequence=args.antibody_sequence,
         cdrs_to_design=args.cdrs_to_design,
         repeatnum=args.repeatnum,
