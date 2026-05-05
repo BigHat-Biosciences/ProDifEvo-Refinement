@@ -6,6 +6,11 @@ set -e
 . /opt/conda/etc/profile.d/conda.sh
 conda activate RERD
 
+# scipy/sklearn compiled wheels link against a newer libstdc++ (CXXABI_1.3.15+)
+# than ubuntu22.04 ships. The conda env has the right one — make sure the
+# dynamic loader finds it first. (conda activate intentionally doesn't set this.)
+export LD_LIBRARY_PATH="/opt/conda/envs/RERD/lib:${LD_LIBRARY_PATH:-}"
+
 # Multi-GPU AF2 dispatch defaults: GPU 0 for torch (diffusion + NBB2),
 # GPUs 1+ for AF workers. JAX preallocation off so it doesn't grab GPU 0.
 # Caller can override either env var by setting them before launch.
