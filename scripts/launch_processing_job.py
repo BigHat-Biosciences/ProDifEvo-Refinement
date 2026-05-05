@@ -1,4 +1,4 @@
-"""Launch a bh-rerd processing job on SageMaker.
+"""Launch a rerd-antibody processing job on SageMaker.
 
 Run from a checkout of the bh-ai repo (so `bh.aicore.training.sage` is importable).
 
@@ -123,7 +123,7 @@ def launch_one(
         run_name=run_name,
     )
     return launch_container_on_sagemaker(
-        image_repo="bh-rerd",
+        image_repo="rerd-antibody",
         image_tag=image_tag,
         command="python",
         arguments=cmd,

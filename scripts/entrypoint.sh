@@ -1,5 +1,5 @@
 #!/bin/bash
-# Entrypoint for the bh-rerd container. Activates the RERD conda env and execs
+# Entrypoint for the rerd-antibody container. Activates the RERD conda env and execs
 # whatever command SageMaker (or the user) passes in.
 set -e
 

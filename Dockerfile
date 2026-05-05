@@ -1,4 +1,4 @@
-# bh-rerd: ProDifEvo-Refinement (AF2.3M backend) for SageMaker processing jobs.
+# rerd-antibody: ProDifEvo-Refinement (AF2.3M backend) for SageMaker processing jobs.
 # Mirrors the bonobo Dockerfile pattern: nvidia/cuda runtime base + miniconda +
 # RERD conda env + pip deps + baked AF2 / NBB2 weights.
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
