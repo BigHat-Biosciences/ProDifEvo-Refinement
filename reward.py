@@ -2,15 +2,19 @@ import numpy as np
 import copy
 from io import StringIO
 
-import pyrosetta
-from pyrosetta import rosetta
+# pyrosetta is optional — only the structural-metric functions in this module
+# need it (and they all reach pyrosetta via reward_utils.pose_read_pdb, which
+# centralizes the install check + init). Confidence-only runs work without it.
+try:
+    from pyrosetta import rosetta
+except ImportError:
+    rosetta = None
+
 from biotite.structure import annotate_sse, AtomArray, rmsd, sasa, superimpose
 import biotite.structure.io as strucio
 from tmtools import tm_align
 
 from reward_utils import *
-
-pyrosetta.init(options="-mute all")
 
 _HYDROPHOBICS = {"VAL", "ILE", "LEU", "PHE", "MET", "TRP"}
 
