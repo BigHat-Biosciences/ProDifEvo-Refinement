@@ -34,7 +34,10 @@ SEED_SEQUENCE="${SEED_SEQUENCE:-EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFA
 # (Even with af_gpu_ids="", we want CUDA_VISIBLE_DEVICES restricted so JAX/NBB2
 # can't accidentally use a different device than expected.)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-unset XLA_PYTHON_CLIENT_PREALLOCATE 2>/dev/null || true
+# Critical: with JAX and torch both on the same GPU, JAX's default 90%
+# preallocation starves torch and cuBLAS fails to init. Disable preallocation
+# so JAX grows its memory pool dynamically alongside torch.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 mkdir -p "$OUTPUT_ROOT"
 ANTIGEN_PDB="${REPO_DIR}/datasets/${ANTIGEN}.pdb"
