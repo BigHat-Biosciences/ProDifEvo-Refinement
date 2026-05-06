@@ -23,6 +23,12 @@ TARGETS="${TARGETS:-pdl1 bhrf1 il3 il20}"
 AF_GPU_IDS="${AF_GPU_IDS:-1,2,3}"
 DOWNLOADS_DIR="${HOME}/Downloads"
 
+# CRITICAL: must match the antibody_sequence the SageMaker design jobs used.
+# If this doesn't match, eval_iptm.py will NBB2-fold a different binder for
+# the AF template, and you'll see a misleading delta vs the original ipTMs.
+# Default below matches the current 4-target campaign (new VHH seed).
+SEED_SEQUENCE="${SEED_SEQUENCE:-EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFAISGSGGSTYYNADSVKGRFTISRDNAKNTLYLQMNSLRAEDTAVYYCARLSITIRPYYGWGQGTLVTVSS}"
+
 # Map each target to its baked antigen PDB (must exist in datasets/).
 declare -A ANTIGEN_PDB=(
     [pdl1]="${REPO_DIR}/datasets/pdl1.pdb"
@@ -78,6 +84,7 @@ for TARGET in $TARGETS; do
         --input_csv "$INPUT_CSV" \
         --antigen_pdb "$PDB" \
         --antigen_chain A \
+        --seed_sequence "$SEED_SEQUENCE" \
         --af_gpu_ids "$AF_GPU_IDS" \
         --write_inplace 0
     echo
