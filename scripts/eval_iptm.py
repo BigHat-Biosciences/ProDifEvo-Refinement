@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -98,6 +99,14 @@ def parse_args() -> argparse.Namespace:
                    help="Sequences per reward_metrics call. Smaller = more frequent "
                         "checkpoints but more Python overhead.")
 
+    # Determinism. Default matches bonobo's eval_compiled_final_iptm.py so
+    # cross-evaluator parity tests are seed-aligned. Colabdesign's Key() falls
+    # back to random.randint(...) (Python's `random`) when no seed is passed,
+    # so seeding `random` here is the load-bearing one for AF stochasticity.
+    p.add_argument("--seed", default=1776, type=int,
+                   help="Seed for python random / numpy / torch. Matches "
+                        "bonobo's eval default of 1776.")
+
     return p.parse_args()
 
 
@@ -130,6 +139,14 @@ def save_cache(path: str, cache: Dict[str, Tuple[float, float, float]]) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    # Seed early (before any colabdesign / mber-open import paths spin up
+    # Key() instances). random.seed() is the one AF actually picks up via
+    # colabdesign.shared.utils.Key.__init__'s random.randint fallback;
+    # numpy/torch are belt-and-braces.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # ---- Load CSV and validate ----
     df = pd.read_csv(args.input_csv)
