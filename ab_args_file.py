@@ -45,7 +45,10 @@ def get_ab_args():
         help="Top-level output directory. Defaults to 'log/' for local runs. "
              "Set to '/opt/ml/processing/output' for SageMaker so artifacts upload to S3.",
     )
-    argparser.add_argument("--seed", type=int, default=0)
+    argparser.add_argument("--seed", type=int, default=1776,
+                           help="Seed for python random / numpy / torch. Default 1776 "
+                                "matches bonobo's eval_compiled_final_iptm.py so design "
+                                "ipTMs are AF-key-deterministic and parity-comparable.")
     argparser.add_argument("--repeatnum", type=int, default=10, help="Batch size (number of parallel designs).")
     argparser.add_argument("--duplicate", type=int, default=20, help="Number of candidates per step.")
     argparser.add_argument("--decoding", type=str, default="SVDD_edit",
