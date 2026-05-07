@@ -140,10 +140,10 @@ if __name__ == "__main__":
         num_recycles=args.num_recycles,
         af_models=tuple(int(x) for x in args.af_models.split(",")),
         use_multimer=args.af_use_multimer,
-        use_template=args.use_template,
-        nbb2_weights_dir=args.nbb2_weights_dir,
+        template_pdb=args.template_pdb,
+        hotspot=args.hotspot,
+        rm_binder_positions=args.rm_binder_positions,
         af_gpu_ids=[int(x) for x in args.af_gpu_ids.split(",") if x.strip()],
-        seed_sequence=antibody_seq,
     )
 
     reward_name_list = ab_reward_model.metrics_name
@@ -221,10 +221,10 @@ if __name__ == "__main__":
         num_recycles=args.num_recycles,
         af_models=tuple(int(x) for x in args.af_models.split(",")),
         use_multimer=args.af_use_multimer,
-        use_template=args.use_template,
-        nbb2_weights_dir=args.nbb2_weights_dir,
+        template_pdb=args.template_pdb,
+        hotspot=args.hotspot,
+        rm_binder_positions=args.rm_binder_positions,
         af_gpu_ids=[int(x) for x in args.af_gpu_ids.split(",") if x.strip()],
-        seed_sequence=antibody_seq,
     )
 
     eval_reward_names = eval_reward_model.metrics_name

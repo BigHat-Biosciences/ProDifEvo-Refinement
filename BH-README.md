@@ -14,17 +14,23 @@ For each candidate sequence in a batch, AF2 is run sequentially (no batching).
 When `iptm` is in `--metrics_name`, the antibody:antigen complex is predicted
 with the AF2 binder protocol; otherwise the antibody monomer is hallucinated.
 
-Optionally, with `--use_template` the antibody is pre-folded each candidate
-with NanoBodyBuilder2 and the combined antigen+antibody PDB is fed to AF2 as
-a binder-side template (backbone only; sequence and sidechains are still
-re-predicted). This mirrors the templating approach in `mber-open` and gives
-AF2 a structural prior on the binder fold instead of fully hallucinating it.
+Binder runs use a **pre-made target+binder template PDB** (bonobo-style)
+supplied via `--template_pdb`, plus a per-target `--hotspot` string that
+biases AF interface attention. The template is built once offline by
+`scripts/generate_template.py` (NBB2-fold antibody seed + concatenate with
+target). At runtime, AF only loads the PDB — no NBB2 in the hot path.
+
+The four baked targets ship with templates and hotspots already configured:
+`datasets/template_{pdl1,bhrf1,il3,il20}.pdb` and the launcher
+(`scripts/launch_processing_job.py`) auto-fills the hotspot per target.
 
 On a multi-GPU host (e.g. g5.12xlarge with 4× A10G), `--af_gpu_ids 1,2,3`
 spreads AF predictions across GPUs 1/2/3 via a `ThreadPoolExecutor` of
-device-pinned workers; GPU 0 stays dedicated to torch (diffusion model +
-NBB2). Sequences are sharded round-robin across workers and reassembled in
-order. ~2.5–3× speedup vs single-GPU on the AF portion.
+device-pinned workers; GPU 0 stays dedicated to torch (diffusion model).
+Sequences are sharded one task per worker (each worker processes its shard
+sequentially) — this avoids a race condition where two threads landing on
+the same worker could overwrite each other's `model.aux`. ~2.5–3× speedup
+vs single-GPU on the AF portion.
 
 ## Setup
 
@@ -110,20 +116,23 @@ bash mber-open/download_weights.sh ~/.mber --skip-esm
 Override the params location at runtime with `--af_params_dir` or the
 `AF_PARAMS_DIR` env var.
 
-#### NBB2 weights (only for `--use_template`)
+#### NBB2 weights (only for `scripts/generate_template.py`)
 
-If you want to run with `--use_template`, also fetch NanoBodyBuilder2 weights
-(~hundreds of MB) into `~/.mber/nbb2_weights`. The vendored script handles
-this in step `[2/4]`:
+If you need to build a new target+binder template (i.e. a new antigen not
+already in `datasets/template_*.pdb`), run `scripts/generate_template.py`
+once. That script imports NanoBodyBuilder2 and needs its weights in
+`~/.mber/nbb2_weights`. The runtime pipeline (ab_refinement.py / SageMaker /
+eval_iptm.py) does NOT depend on NBB2 — it just reads the pre-made PDB.
+
+Pre-fetch NBB2 weights via:
 
 ```bash
 bash mber-open/download_weights.sh ~/.mber --skip-esm
 # Ctrl+C after step [2/4] completes; AF2 step [1/4] also runs but is harmless if already done.
 ```
 
-Override the location at runtime with `--nbb2_weights_dir` or the
-`NBB2_WEIGHTS_DIR` env var. Also `pip install ImmuneBuilder` if it wasn't
-pulled by `requirements.txt`.
+Override location with `--nbb2_weights_dir` on `generate_template.py`. Also
+`pip install ImmuneBuilder` if it wasn't pulled by `requirements.txt`.
 
 `ImmuneBuilder.refine` imports `pdbfixer` (which depends on OpenMM) at module
 load. Neither is on PyPI cleanly, so install via conda-forge — these are the
@@ -151,23 +160,25 @@ VHHs are single-domain heavy chains, so use `--chain_type heavy`.
 ```bash
 export AF_PARAMS_DIR="$HOME/.mber/af_params"
 
-CUDA_VISIBLE_DEVICES=0 python ab_refinement.py \
-    --antibody_sequence "EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKDRLSITIRPRYYGLDVWGQGTLVTVSS" \
+CUDA_VISIBLE_DEVICES=0,1,2,3 XLA_PYTHON_CLIENT_PREALLOCATE=false python ab_refinement.py \
+    --antibody_sequence "EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFAISGSGGSTYYNADSVKGRFTISRDNAKNTLYLQMNSLRAEDTAVYYCARLSITIRPYYGWGQGTLVTVSS" \
     --antigen_pdb datasets/pdl1.pdb \
     --antigen_chain A \
     --chain_type heavy \
-    --cdrs_to_design H3 \
+    --cdrs_to_design H1,H2,H3 \
     --numbering_scheme imgt \
     --metrics_name iptm,cdr_plddt,plddt \
     --metrics_list 3,1,1 \
-    --repeatnum 3 \
+    --repeatnum 100 \
     --duplicate 5 \
-    --iteration 10 \
+    --iteration 5 \
     --decoding SVDD_edit \
     --af_params_dir "$AF_PARAMS_DIR" \
     --num_recycles 3 \
     --af_models 0 \
-    --use_template
+    --template_pdb datasets/template_pdl1.pdb \
+    --hotspot A113 \
+    --af_gpu_ids 1,2,3
 ```
 
 ### Monomer-only design (no antigen, plddt-driven)
@@ -214,12 +225,13 @@ python ab_refinement.py \
 | `--af_use_multimer` | `True` | Use multimer params (required for `iptm`). |
 | `--af_no_multimer` | – | Disable multimer mode. |
 
-### NBB2 binder templating (optional)
+### Binder templating (bonobo-style)
 
 | flag | default | meaning |
 | --- | --- | --- |
-| `--use_template` | off | Pre-fold the antibody with NBB2 each candidate and feed the combined antigen+antibody PDB to AF2 as a binder-side template. Requires `iptm` in `--metrics_name`. |
-| `--nbb2_weights_dir` | `$NBB2_WEIGHTS_DIR` or `~/.mber/nbb2_weights` | Where NBB2 weights live. |
+| `--template_pdb` | (required for binder runs) | Path to a pre-made multi-chain PDB containing target + binder. Generate with `scripts/generate_template.py`. |
+| `--hotspot` | `None` | Hotspot residues on the target chain (e.g. `A113`). Pass-through to colabdesign's `_prep_binder` hotspot arg; biases AF interface attention. |
+| `--rm_binder_positions` | bonobo's 32-position string | Override the CDR mask string (e.g. for a non-standard antibody scaffold). Used identically for `rm_binder`, `rm_binder_seq`, `rm_binder_sc`. |
 
 ### Multi-GPU AF (optional)
 
@@ -272,12 +284,9 @@ containing:
   ensemble only for the final evaluation pass, not during refinement.
 - ipTM only makes sense with `--af_use_multimer`. Don't pass `--af_no_multimer`
   if `iptm` is in `--metrics_name`.
-- `--use_template` adds an NBB2 fold (~1s) and an AF2 `_prep_binder` re-call
-  per candidate. Expect ~1.5–2× slowdown vs the no-template path. The AF2 JIT
-  compile cost is still amortized across candidates since `binder_len` is
-  constant within a run.
+- `--template_pdb` adds zero per-candidate cost. The template `_prep_binder`
+  call runs once at startup; subsequent predicts are pure forward passes.
 - `--af_gpu_ids 1,2,3` typically gives ~2.5–3× wall-clock speedup on a 4-GPU
-  box vs single-GPU. The speedup applies only to the AF portion; NBB2 fold
-  (when `--use_template` is on) stays sequential on GPU 0. First-step JIT
-  compile happens on each AF GPU independently — expect the first iteration
+  box vs single-GPU. The speedup applies only to the AF portion. First-step
+  JIT compile happens on each AF GPU independently — expect the first iteration
   to be slow, then steady-state to be fast.

@@ -23,11 +23,13 @@ TARGETS="${TARGETS:-pdl1 bhrf1 il3 il20}"
 AF_GPU_IDS="${AF_GPU_IDS:-1,2,3}"
 DOWNLOADS_DIR="${HOME}/Downloads"
 
-# CRITICAL: must match the antibody_sequence the SageMaker design jobs used.
-# If this doesn't match, eval_iptm.py will NBB2-fold a different binder for
-# the AF template, and you'll see a misleading delta vs the original ipTMs.
-# Default below matches the current 4-target campaign (new VHH seed).
-SEED_SEQUENCE="${SEED_SEQUENCE:-EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFAISGSGGSTYYNADSVKGRFTISRDNAKNTLYLQMNSLRAEDTAVYYCARLSITIRPYYGWGQGTLVTVSS}"
+# Per-target hotspots (mirror bonobo's TARGETS dict).
+declare -A HOTSPOTS=(
+    [pdl1]="A113"
+    [bhrf1]="A60,A61,A63,A71"
+    [il3]="A23,A25,A26,A31,A40,A104"
+    [il20]="A58,A62,A101"
+)
 
 # Map each target to its baked antigen PDB (must exist in datasets/).
 declare -A ANTIGEN_PDB=(
@@ -80,11 +82,18 @@ for TARGET in $TARGETS; do
     echo "=== re-scoring $TARGET ==="
     echo "  input:   $INPUT_CSV"
     echo "  antigen: $PDB"
+    TEMPLATE_PDB="${REPO_DIR}/datasets/template_${TARGET}.pdb"
+    HOTSPOT="${HOTSPOTS[$TARGET]:-}"
+    if [ ! -f "$TEMPLATE_PDB" ]; then
+        echo "[$TARGET] template not found at $TEMPLATE_PDB; skipping"
+        continue
+    fi
     python "${REPO_DIR}/scripts/eval_iptm.py" \
         --input_csv "$INPUT_CSV" \
         --antigen_pdb "$PDB" \
         --antigen_chain A \
-        --seed_sequence "$SEED_SEQUENCE" \
+        --template_pdb "$TEMPLATE_PDB" \
+        --hotspot "$HOTSPOT" \
         --af_gpu_ids "$AF_GPU_IDS" \
         --write_inplace 0
     echo

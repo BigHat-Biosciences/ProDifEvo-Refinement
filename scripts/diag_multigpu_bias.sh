@@ -32,6 +32,20 @@ CONDA_ENV="${CONDA_ENV:-RERD}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/tmp/rerd_multigpu_diag}"
 SEED_SEQUENCE="${SEED_SEQUENCE:-EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFAISGSGGSTYYNADSVKGRFTISRDNAKNTLYLQMNSLRAEDTAVYYCARLSITIRPYYGWGQGTLVTVSS}"
 
+# Per-target hotspots (mirror bonobo's TARGETS dict).
+declare -A HOTSPOTS=(
+    [pdl1]="A113"
+    [bhrf1]="A60,A61,A63,A71"
+    [il3]="A23,A25,A26,A31,A40,A104"
+    [il20]="A58,A62,A101"
+)
+HOTSPOT="${HOTSPOTS[$ANTIGEN]:-}"
+TEMPLATE_PDB="${REPO_DIR}/datasets/template_${ANTIGEN}.pdb"
+if [ ! -f "$TEMPLATE_PDB" ]; then
+    echo "ERROR: template not found at $TEMPLATE_PDB. Generate with scripts/generate_template.py."
+    exit 1
+fi
+
 # Multi-GPU layout: torch on GPU 0 (diffusion + NBB2), JAX on GPUs 1/2/3.
 # Same env vars as run_ab_binding.sh.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -77,7 +91,8 @@ python ab_refinement.py \
     --decoding SVDD_edit \
     --num_recycles 3 \
     --af_models 0 \
-    --use_template \
+    --template_pdb "$TEMPLATE_PDB" \
+    --hotspot "$HOTSPOT" \
     --af_gpu_ids "$AF_GPU_IDS" \
     --output_root "$OUTPUT_ROOT" \
     --run_name "$RUN_NAME"
@@ -99,7 +114,8 @@ python scripts/eval_iptm.py \
     --input_csv "$OUTPUT_CSV" \
     --antigen_pdb "$ANTIGEN_PDB" \
     --antigen_chain A \
-    --seed_sequence "$SEED_SEQUENCE" \
+    --template_pdb "$TEMPLATE_PDB" \
+    --hotspot "$HOTSPOT" \
     --af_gpu_ids "$AF_GPU_IDS" \
     --cache_dir "${OUTPUT_ROOT}/iptm_cache" \
     --write_inplace 0

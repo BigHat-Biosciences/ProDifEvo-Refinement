@@ -30,6 +30,20 @@ CONDA_ENV="${CONDA_ENV:-RERD}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/tmp/rerd_singlegpu_diag}"
 SEED_SEQUENCE="${SEED_SEQUENCE:-EVQLVESGGGLVQPGGSLRLSCAASGGFTFSSYAMWFRQAPGKEREFAISGSGGSTYYNADSVKGRFTISRDNAKNTLYLQMNSLRAEDTAVYYCARLSITIRPYYGWGQGTLVTVSS}"
 
+# Per-target hotspots (mirror bonobo's TARGETS dict).
+declare -A HOTSPOTS=(
+    [pdl1]="A113"
+    [bhrf1]="A60,A61,A63,A71"
+    [il3]="A23,A25,A26,A31,A40,A104"
+    [il20]="A58,A62,A101"
+)
+HOTSPOT="${HOTSPOTS[$ANTIGEN]:-}"
+TEMPLATE_PDB="${REPO_DIR}/datasets/template_${ANTIGEN}.pdb"
+if [ ! -f "$TEMPLATE_PDB" ]; then
+    echo "ERROR: template not found at $TEMPLATE_PDB. Generate with scripts/generate_template.py."
+    exit 1
+fi
+
 # Pin to a single GPU so neither the design nor the eval can see other devices.
 # (Even with af_gpu_ids="", we want CUDA_VISIBLE_DEVICES restricted so JAX/NBB2
 # can't accidentally use a different device than expected.)
@@ -78,7 +92,8 @@ python ab_refinement.py \
     --decoding SVDD_edit \
     --num_recycles 3 \
     --af_models 0 \
-    --use_template \
+    --template_pdb "$TEMPLATE_PDB" \
+    --hotspot "$HOTSPOT" \
     --output_root "$OUTPUT_ROOT" \
     --run_name "$RUN_NAME"
 
@@ -99,7 +114,8 @@ python scripts/eval_iptm.py \
     --input_csv "$OUTPUT_CSV" \
     --antigen_pdb "$ANTIGEN_PDB" \
     --antigen_chain A \
-    --seed_sequence "$SEED_SEQUENCE" \
+    --template_pdb "$TEMPLATE_PDB" \
+    --hotspot "$HOTSPOT" \
     --af_gpu_ids "" \
     --cache_dir "${OUTPUT_ROOT}/iptm_cache" \
     --write_inplace 0

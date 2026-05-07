@@ -1,14 +1,8 @@
 """Re-score sequences in a CSV through this repo's AF2 reward backend.
 
-Mirrors bonobo's eval_compiled_final_iptm.py in spirit but uses *this* repo's
-reward stack (NBB2 binder pre-fold + IMGT CDR mask + no hotspot + multi-GPU
-dispatch), so the scores it produces match what `ab_refinement.py` itself
-writes to ``output.csv``. This is the correct comparison for verifying
-RERD-internal ipTM values.
-
-If you want bonobo-comparable scores, use bonobo's script instead — it uses
-a different binder template, a different rm_binder mask scope, and an
-explicit hotspot per target. Same AF2 model, different conditioning.
+Bonobo-style: requires a pre-made target+binder template PDB (--template_pdb)
+and a per-target hotspot (--hotspot). Scores produced match what
+``ab_refinement.py`` writes to ``output.csv`` for runs using the same template.
 
 Reads:  any CSV with a ``sequence`` column (configurable via --sequence_col).
 Writes: same CSV with new columns: final_iptm, final_cdr_plddt, final_plddt
@@ -24,6 +18,8 @@ Example
         --input_csv ~/Downloads/rerd_pdl1.csv \\
         --antigen_pdb datasets/pdl1.pdb \\
         --antigen_chain A \\
+        --template_pdb datasets/template_pdl1.pdb \\
+        --hotspot A113 \\
         --af_gpu_ids 1,2,3
 """
 
@@ -65,13 +61,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--antigen_pdb", required=True)
     p.add_argument("--antigen_chain", default="A")
 
-    p.add_argument(
-        "--seed_sequence", default=None,
-        help="Antibody seed used for the one-shot NBB2 fold. If None, uses the first "
-             "sequence in --input_csv (which assumes all rows share the same framework).",
-    )
     p.add_argument("--cdrs_to_design", default="H1,H2,H3",
-                   help="Which CDRs to mask from the binder template (rm_binder).")
+                   help="Which CDRs to detect via ANARCI for cdr_plddt extraction.")
     p.add_argument("--chain_type", default="heavy", choices=["heavy", "light"])
     p.add_argument("--numbering_scheme", default="imgt", choices=["imgt", "chothia", "kabat"])
     p.add_argument(
@@ -86,11 +77,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--af_models", default="0", help="Comma-separated AF2 model indices.")
     p.add_argument("--af_gpu_ids", default="",
                    help="Comma-separated JAX device IDs for parallel AF, e.g. '1,2,3'.")
-    p.add_argument("--use_template", action="store_true", default=True,
-                   help="Use NBB2 binder pre-fold + one-shot template init (default).")
-    p.add_argument("--no_template", dest="use_template", action="store_false",
-                   help="Disable templating; full hallucination of binder backbone.")
-    p.add_argument("--nbb2_weights_dir", default=None)
+    p.add_argument("--template_pdb", required=True,
+                   help="Path to a pre-made multi-chain PDB containing target + binder. "
+                        "Generate one with scripts/generate_template.py.")
+    p.add_argument("--hotspot", default=None,
+                   help="Hotspot residues on the target chain, e.g. 'A113'.")
+    p.add_argument("--rm_binder_positions", default=None,
+                   help="Override the bonobo-default 32-position CDR mask string. "
+                        "Used identically for rm_binder, rm_binder_seq, rm_binder_sc.")
 
     # Output / caching
     p.add_argument("--output_csv", default=None,
@@ -147,32 +141,35 @@ def main() -> None:
     if not sequences:
         sys.exit("No sequences in input CSV.")
 
-    seed_seq: str = args.seed_sequence or sequences[0]
-    seq_len = len(seed_seq)
+    # All input sequences must have the same length (use sequences[0] as a
+    # reference for ANARCI CDR detection; framework positions are fixed across
+    # all designs, so any sequence works).
+    ref_seq = sequences[0]
+    seq_len = len(ref_seq)
     bad_lens = [(i, len(s)) for i, s in enumerate(sequences) if len(s) != seq_len]
     if bad_lens:
         sys.exit(
-            f"All sequences must have the same length as the seed ({seq_len}). "
+            f"All sequences must have the same length ({seq_len}). "
             f"Found mismatches at rows {bad_lens[:5]}{'...' if len(bad_lens) > 5 else ''}"
         )
 
-    # ---- CDR detection (matches the design loop's logic) ----
+    # ---- CDR detection (only used for cdr_plddt metric extraction) ----
     if args.cdr_indices is not None:
         manual_indices: Optional[str] = args.cdr_indices
     else:
         manual_indices = None
     cdr_indices, framework_indices = get_cdr_and_framework_indices(
-        sequence=seed_seq,
+        sequence=ref_seq,
         scheme=args.numbering_scheme,
         chain_type=args.chain_type,
         cdrs_to_design=args.cdrs_to_design,
         manual_cdr_indices=manual_indices,
     )
-    print(f"Seed length: {seq_len}")
+    print(f"Sequence length: {seq_len}")
     print(f"CDR positions ({len(cdr_indices)}): {cdr_indices}")
     print(f"Framework positions ({len(framework_indices)})")
 
-    # ---- Build reward model (one-shot template init happens lazily on first call) ----
+    # ---- Build reward model ----
     af_gpu_ids = [int(x) for x in args.af_gpu_ids.split(",") if x.strip()]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reward_model = AbAF2RewardCal(
@@ -188,10 +185,10 @@ def main() -> None:
         num_recycles=args.num_recycles,
         af_models=tuple(int(x) for x in args.af_models.split(",")),
         use_multimer=True,
-        use_template=args.use_template,
-        nbb2_weights_dir=args.nbb2_weights_dir,
+        template_pdb=args.template_pdb,
+        hotspot=args.hotspot,
+        rm_binder_positions=args.rm_binder_positions,
         af_gpu_ids=af_gpu_ids,
-        seed_sequence=seed_seq,
     )
 
     # ---- Cache setup ----

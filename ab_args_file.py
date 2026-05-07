@@ -112,19 +112,25 @@ def get_ab_args():
         help="Disable AF2 multimer mode (use monomer params).",
     )
 
-    # ---- NBB2 binder templating ----
+    # ---- Binder templating (bonobo-style: pre-made combined PDB on disk) ----
     argparser.add_argument(
-        "--use_template", action="store_true", default=False,
-        help="Pre-fold the antibody with NanoBodyBuilder2 each candidate and feed the "
-             "combined antigen+antibody PDB as a binder-side template to AF2. "
-             "Only valid when 'iptm' is in --metrics_name. Adds NBB2 fold + AF2 re-prep "
-             "latency per candidate, but improves binder backbone realism.",
+        "--template_pdb", type=str, default=None,
+        help="Path to a pre-made multi-chain PDB containing target + binder. "
+             "Required for binder runs (iptm in --metrics_name). Generate one "
+             "with scripts/generate_template.py.",
     )
     argparser.add_argument(
-        "--nbb2_weights_dir", type=str, default=None,
-        help="Path to NanoBodyBuilder2 weights directory. If None, falls back to "
-             "$NBB2_WEIGHTS_DIR or ~/.mber/nbb2_weights. Get weights via "
-             "mber-open/download_weights.sh (step [2/4]).",
+        "--hotspot", type=str, default=None,
+        help="Hotspot residues on the target chain biasing AF interface attention, "
+             "e.g. 'A113' or 'A60,A61,A63,A71'. Pass-through to colabdesign's "
+             "_prep_binder hotspot arg.",
+    )
+    argparser.add_argument(
+        "--rm_binder_positions", type=str, default=None,
+        help="Comma-separated binder-chain CDR positions to mask from the AF "
+             "template (e.g. 'H27,H28,...,H107'). Used identically for "
+             "rm_binder, rm_binder_seq, and rm_binder_sc. Defaults to bonobo's "
+             "Chothia-style 32-position string (H27-H35, H48-H58, H96-H107).",
     )
 
     # ---- Multi-GPU AF parallelism ----

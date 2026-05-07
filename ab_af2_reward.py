@@ -1,29 +1,34 @@
 """AlphaFold2.3-multimer reward backend for antibody CDR design.
 
-Replaces the ESMFold-based ``AbRewardCal`` from ``ab_refinement.py`` with a
-colabdesign-driven AF2 backend. Two underlying models are constructed lazily:
+Bonobo-style: the binder template is supplied as a pre-made multi-chain PDB
+(target chain + binder chain on disk). No NBB2 binder pre-folding at runtime.
+Build templates offline with ``scripts/generate_template.py`` (the only place
+NBB2 is invoked).
 
-* ``mk_afdesign_model(protocol="binder", use_multimer=True)`` for predicting the
-  antibody:antigen complex (used when ``iptm`` is requested). The antigen PDB
-  is supplied as the target template; the antibody is hallucinated as the
-  binder of length ``ab_len``.
+Two underlying models are constructed lazily:
+
+* ``mk_afdesign_model(protocol="binder", use_multimer=True)`` for predicting
+  the antibody:antigen complex (used when ``iptm`` is requested). Requires a
+  ``template_pdb`` path containing target + binder.
 * ``mk_afdesign_model(protocol="hallucination", use_multimer=False)`` for
-  predicting the antibody monomer (used when only monomer-style metrics like
-  ``plddt``, ``cdr_plddt``, ``ptm`` are requested without an antigen).
+  predicting the antibody monomer (used when no antigen is involved).
 
-AF2 is not batchable like ESMFold — each candidate sequence is predicted
-sequentially. Per-sequence metrics are extracted from ``model.aux``.
+AF2 is not batchable — each candidate sequence is predicted sequentially per
+worker. Multi-GPU is supported via ``af_gpu_ids``: one ``_AFWorker`` per GPU,
+each holding its own colabdesign model. Sequences are sharded one task per
+worker (each worker processes its shard sequentially) — this avoids the
+race condition where two threads landing on the same worker could overwrite
+each other's ``model.aux``.
 
 AF2 weights are expected to live in ``~/.mber/af_params`` by default; this can
 be overridden with the ``AF_PARAMS_DIR`` env var or the ``af_params_dir`` ctor
-argument. See ``mber-open/download_weights.sh`` for how to obtain them.
+argument.
 """
 
 from __future__ import annotations
 
 import os
 import logging
-import tempfile
 import time
 from io import StringIO
 from typing import List, Optional, Sequence
@@ -34,7 +39,6 @@ import numpy as np
 # fail on environments where AF2 is not yet installed. Defer to first use.
 _AF_FACTORY = None
 _CLEAR_MEM = None
-_NBB2_CLS = None
 
 
 def _lazy_import_colabdesign():
@@ -55,61 +59,19 @@ def _lazy_import_colabdesign():
     return _AF_FACTORY, _CLEAR_MEM
 
 
-def _lazy_import_nbb2():
-    """Import NanoBodyBuilder2 on first use."""
-    global _NBB2_CLS
-    if _NBB2_CLS is not None:
-        return _NBB2_CLS
-    try:
-        from ImmuneBuilder import NanoBodyBuilder2
-    except ImportError as e:
-        raise ImportError(
-            "ImmuneBuilder is required for --use_template (NanoBodyBuilder2 binder pre-folding). "
-            "Install with: pip install ImmuneBuilder"
-        ) from e
-    _NBB2_CLS = NanoBodyBuilder2
-    return _NBB2_CLS
-
-
 ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
 
-
-def _combine_target_and_binder_pdb(
-    target_pdb_path: str,
-    binder_pdb_str: str,
-    target_chain: str,
-    binder_chain: str = "H",
-) -> str:
-    """Concatenate target ATOMs and binder ATOMs into a single multi-chain PDB string.
-
-    Vendored from mber-open's pdb_utils.combine_structures, simplified to operate
-    on a target PDB path + a binder PDB string. The binder chain is rewritten to
-    ``binder_chain`` (default 'H'); the target keeps its existing chain ID.
-    """
-    with open(target_pdb_path, "r") as f:
-        target_pdb = f.read()
-
-    lines = ["HEADER    PROTEIN", "TITLE     COMBINED TARGET+BINDER (NBB2 TEMPLATE)"]
-    atom_count = 1
-
-    for line in target_pdb.splitlines():
-        if line.startswith("ATOM"):
-            lines.append(f"ATOM  {atom_count:5d}{line[11:]}")
-            atom_count += 1
-    lines.append(f"TER   {atom_count:5d}      {target_chain}")
-
-    binder_atoms = 0
-    for line in binder_pdb_str.splitlines():
-        if line.startswith("ATOM"):
-            # Force the binder chain ID to `binder_chain` (column 22, 0-indexed 21).
-            new_line = f"ATOM  {atom_count:5d}{line[11:21]}{binder_chain}{line[22:]}"
-            lines.append(new_line)
-            atom_count += 1
-            binder_atoms += 1
-    if binder_atoms > 0:
-        lines.append(f"TER   {atom_count:5d}      {binder_chain}")
-    lines.append("END")
-    return "\n".join(lines)
+# Bonobo-style hardcoded CDR mask: covers Chothia-style CDR-H1 (H27-H35),
+# CDR-H2 (H48-H58), CDR-H3 (H96-H107) — 32 positions on the binder chain. Used
+# identically for rm_binder, rm_binder_seq, rm_binder_sc so AF re-hallucinates
+# CDR backbone, sequence identity, and sidechains while keeping the framework
+# templated. Override via ``rm_binder_positions`` ctor arg if your antibody
+# scaffold uses different boundaries.
+DEFAULT_RM_BINDER_POSITIONS = ",".join(
+    [f"H{i}" for i in range(27, 36)]   # CDR-H1: H27..H35
+    + [f"H{i}" for i in range(48, 59)] # CDR-H2: H48..H58
+    + [f"H{i}" for i in range(96, 108)]# CDR-H3: H96..H107
+)
 
 
 # ============================================================
@@ -188,8 +150,12 @@ class _AFWorker:
 
     Each worker holds its own complex/monomer model handles. All JAX ops are
     executed inside ``jax.default_device(jax_device)`` so that compilation and
-    forward passes are routed to that device. Workers don't share state, so a
-    pool of them can run concurrently from a ThreadPoolExecutor.
+    forward passes are routed to that device.
+
+    Concurrency note: workers are NOT internally thread-safe — each worker
+    mutates ``model.aux`` on every predict call. The dispatcher in
+    ``AbAF2RewardCal._reward_metrics_parallel`` shards sequences such that
+    each worker is owned by exactly one ThreadPoolExecutor task at a time.
     """
 
     def __init__(
@@ -202,6 +168,7 @@ class _AFWorker:
         antigen_pdb: Optional[str],
         antigen_chain: str,
         binder_chain: str = "H",
+        hotspot: Optional[str] = None,
     ):
         self.jax_device = jax_device
         self.af_params_dir = af_params_dir
@@ -211,16 +178,17 @@ class _AFWorker:
         self.antigen_pdb = antigen_pdb
         self.antigen_chain = antigen_chain
         self.binder_chain = binder_chain
+        self.hotspot = hotspot
 
         self._complex_model = None
         self._complex_target_len = 0
         self._complex_binder_len = 0
-        self._template_initialized = False  # set True after init_template()
+        self._template_initialized = False
         self._monomer_model = None
         self._monomer_len = 0
 
     def _ensure_complex_model(self, ab_len: int) -> None:
-        """Build the non-templated binder model. Skipped when templating is in use."""
+        """Build the non-templated binder model (full hallucination of binder)."""
         mk_model, clear_mem = _lazy_import_colabdesign()
         if self._complex_model is None or self._complex_binder_len != ab_len:
             if self._complex_model is not None:
@@ -236,7 +204,7 @@ class _AFWorker:
                 pdb_filename=self.antigen_pdb,
                 chain=self.antigen_chain,
                 binder_len=ab_len,
-                hotspot=None,
+                hotspot=self.hotspot,
                 seed=0,
                 rm_target=False,
                 rm_target_seq=False,
@@ -249,16 +217,14 @@ class _AFWorker:
             self._complex_binder_len = ab_len
             self._complex_target_len = int(self._complex_model._target_len)
 
-    def init_template(self, combined_pdb_path: str, rm_binder_str: str, ab_len: int) -> None:
-        """One-shot template init: build a binder model with the combined target+binder PDB
-        and bake in the CDR-position mask via ``rm_binder``. After this call, ``predict_complex``
-        is just a forward pass — no per-candidate ``_prep_binder``.
+    def init_template(self, template_pdb_path: str, rm_binder_str: str) -> None:
+        """One-shot template init: build a binder model with the combined target+binder
+        PDB, masking the binder template at the bonobo-style CDR positions.
 
-        Args:
-            combined_pdb_path: Path to a multi-chain PDB containing target + pre-folded binder.
-            rm_binder_str: Comma-separated colabdesign positions to mask from the binder
-                template (e.g. ``"H97,H98,..."`` for designed CDR positions).
-            ab_len: Antibody length, used to validate model reuse.
+        ``rm_binder``, ``rm_binder_seq``, ``rm_binder_sc`` are all set to the same
+        position string (per bonobo). This causes AF to re-hallucinate the CDR
+        backbone, sequence identity, and sidechains while keeping the framework
+        templated.
         """
         import jax
         mk_model, clear_mem = _lazy_import_colabdesign()
@@ -273,21 +239,21 @@ class _AFWorker:
                 num_recycles=self.num_recycles,
             )
             self._complex_model._prep_binder(
-                pdb_filename=combined_pdb_path,
+                pdb_filename=template_pdb_path,
                 chain=self.antigen_chain,
                 binder_chain=self.binder_chain,
-                hotspot=None,
+                hotspot=self.hotspot,
                 seed=0,
                 rm_target=False,
                 rm_target_seq=False,
                 rm_target_sc=False,
                 rm_template_ic=True,
                 rm_binder=rm_binder_str,
-                rm_binder_seq=True,
-                rm_binder_sc=True,
+                rm_binder_seq=rm_binder_str,
+                rm_binder_sc=rm_binder_str,
             )
-            self._complex_binder_len = ab_len
             self._complex_target_len = int(self._complex_model._target_len)
+            self._complex_binder_len = int(self._complex_model._binder_len)
             self._template_initialized = True
 
     def _ensure_monomer_model(self, ab_len: int) -> None:
@@ -308,8 +274,9 @@ class _AFWorker:
     def predict_complex(self, ab_seq: str) -> tuple:
         """Run a complex prediction. Returns (aux, target_len).
 
-        If ``init_template`` was called, the model is already templated — this just runs
-        ``predict``. Otherwise the non-templated path builds a fresh model on first call.
+        If ``init_template`` was called, the model is already templated — this
+        just runs ``predict``. Otherwise the non-templated path builds a fresh
+        full-hallucination model on first call.
         """
         import jax
         with jax.default_device(self.jax_device):
@@ -354,15 +321,15 @@ class AbAF2RewardCal:
         pdb_save_path: str = "ab_sc_tmp",
         antigen_pdb: Optional[str] = None,
         antigen_chain: Optional[str] = None,
-        antigen_seq: Optional[str] = None,  # accepted for API parity; not used by AF2 binder protocol
+        antigen_seq: Optional[str] = None,  # accepted for API parity; not used
         af_params_dir: Optional[str] = None,
         num_recycles: int = 3,
         af_models: Sequence[int] = (0,),
         use_multimer: bool = True,
-        use_template: bool = False,
-        nbb2_weights_dir: Optional[str] = None,
+        template_pdb: Optional[str] = None,
+        hotspot: Optional[str] = None,
+        rm_binder_positions: Optional[str] = None,
         af_gpu_ids: Optional[Sequence[int]] = None,
-        seed_sequence: Optional[str] = None,
         # ignored kwargs for backward compat with old call sites
         esm_model: Optional[str] = None,
     ):
@@ -397,120 +364,55 @@ class AbAF2RewardCal:
         self.af_models = list(af_models)
         self.use_multimer = use_multimer
 
-        # NBB2 templating: per-candidate NBB2 fold of the antibody is fed to
-        # AF2's binder protocol as a binder-side template (backbone only).
-        self.use_template = bool(use_template)
-        if self.use_template and not self.needs_complex:
+        # Template-based binder prediction (bonobo-style). When template_pdb is
+        # set, the AF binder model is built once with that PDB as the template;
+        # per-candidate predicts are pure forward passes. Required for binder
+        # runs (iptm metric). The template PDB must contain the target on
+        # ``antigen_chain`` and the binder on chain "H" (or override below).
+        self.template_pdb: Optional[str] = template_pdb
+        if self.needs_complex and self.template_pdb is None:
             raise ValueError(
-                "--use_template requires complex prediction (i.e. 'iptm' in --metrics_name). "
-                "Templating is only meaningful when an antigen is present."
+                "Binder runs (iptm metric) require --template_pdb pointing at a "
+                "pre-made multi-chain PDB containing target + binder. Generate "
+                "one with scripts/generate_template.py."
             )
-        self.nbb2_weights_dir = os.path.expanduser(
-            nbb2_weights_dir
-            or os.environ.get("NBB2_WEIGHTS_DIR", "~/.mber/nbb2_weights")
-        )
-        # Binder chain to use in the combined template PDB. NBB2 emits chain 'H'
-        # for nanobody heavy chain; we keep that for clarity.
+        if self.template_pdb is not None and not os.path.exists(self.template_pdb):
+            raise FileNotFoundError(f"--template_pdb not found: {self.template_pdb}")
+
+        self.hotspot: Optional[str] = hotspot
+        self.rm_binder_positions: str = rm_binder_positions or DEFAULT_RM_BINDER_POSITIONS
         self._binder_chain = "H"
-
-        # Seed sequence used for the one-shot NBB2 fold when templating is enabled.
-        # The CDR positions are masked out of the binder template via rm_binder, so
-        # the seed sequence's CDR atoms don't matter — only the framework atoms do.
-        self.seed_sequence = seed_sequence
-        if self.use_template and not self.seed_sequence:
-            raise ValueError(
-                "--use_template requires a seed antibody sequence to fold once at startup. "
-                "Pass seed_sequence=args.antibody_sequence."
-            )
-
-        # One-shot template state: the serial-mode AF model is templated lazily on first
-        # call; parallel-mode workers are templated when _ensure_workers builds them.
-        self._template_initialized_serial = False
-
-        # Lazy-initialised colabdesign model handles
-        self._complex_model = None
-        self._monomer_model = None
-        self._complex_target_len = 0   # number of antigen residues in the complex
-        self._complex_binder_len = 0   # antibody length the complex was prepped for
-        self._monomer_len = 0          # antibody length the monomer was prepped for
-
-        # Lazy NBB2 model handle (only built if use_template).
-        self._nbb2_model = None
 
         # Multi-GPU AF parallelism. If af_gpu_ids has 2+ device IDs, AF
         # predictions are dispatched in parallel across one _AFWorker per GPU.
-        # If 0 or 1 device IDs, the existing serial path on the default device
-        # is used (no behavior change).
+        # If 0 or 1 device IDs, the single-instance serial path is used.
         self.af_gpu_ids = list(af_gpu_ids) if af_gpu_ids else []
         self._workers: List["_AFWorker"] = []  # lazy-built on first use
 
         # Cumulative timing/counts. Updated by reward_metrics on every call.
         self._timings = {
-            "n_sequences": 0,        # total sequences scored
-            "reward_seconds": 0.0,   # total wall time inside reward_metrics
-            "n_calls": 0,            # number of reward_metrics invocations
+            "n_sequences": 0,
+            "reward_seconds": 0.0,
+            "n_calls": 0,
         }
 
-    # --------------------------------------------------------
-    # Model construction
-    # --------------------------------------------------------
-    def _ensure_complex_model(self, ab_len: int) -> None:
-        mk_model, clear_mem = _lazy_import_colabdesign()
-        if self._complex_model is None or self._complex_binder_len != ab_len:
-            if self._complex_model is not None:
-                clear_mem()
-            logging.info(
-                f"[AF2] Building binder/multimer model (params={self.af_params_dir}, "
-                f"recycles={self.num_recycles}, multimer={self.use_multimer}, ab_len={ab_len})"
-            )
-            self._complex_model = mk_model(
-                protocol="binder",
-                debug=False,
-                data_dir=self.af_params_dir,
-                use_multimer=self.use_multimer,
-                num_recycles=self.num_recycles,
-            )
-            self._complex_model._prep_binder(
-                pdb_filename=self.antigen_pdb,
-                chain=self.antigen_chain,
-                binder_len=ab_len,
-                hotspot=None,
-                seed=0,
-                rm_target=False,
-                rm_target_seq=False,
-                rm_target_sc=False,
-                rm_template_ic=True,
-                rm_binder=True,
-                rm_binder_seq=True,
-                rm_binder_sc=True,
-            )
-            self._complex_binder_len = ab_len
-            self._complex_target_len = int(self._complex_model._target_len)
+        # Single-instance handles for serial mode (only built when not using
+        # multi-GPU dispatch). Templated complex model is built once on first call.
+        self._complex_model = None
+        self._complex_target_len = 0
+        self._complex_binder_len = 0
+        self._serial_template_initialized = False
+        self._monomer_model = None
+        self._monomer_len = 0
 
-    def _ensure_monomer_model(self, ab_len: int) -> None:
-        mk_model, clear_mem = _lazy_import_colabdesign()
-        if self._monomer_model is None or self._monomer_len != ab_len:
-            if self._monomer_model is not None:
-                clear_mem()
-            logging.info(
-                f"[AF2] Building hallucination/monomer model (recycles={self.num_recycles}, ab_len={ab_len})"
-            )
-            self._monomer_model = mk_model(
-                protocol="hallucination",
-                use_templates=False,
-                num_recycles=self.num_recycles,
-                data_dir=self.af_params_dir,
-                use_multimer=False,
-            )
-            # Hallucination protocol needs an explicit length; safe to call repeatedly.
-            self._monomer_model._prep_hallucination(length=ab_len)
-            self._monomer_len = ab_len
-
+    # --------------------------------------------------------
+    # Worker pool (multi-GPU)
+    # --------------------------------------------------------
     def _ensure_workers(self) -> None:
-        """Lazy-build a pool of _AFWorker instances pinned to ``af_gpu_ids``.
+        """Lazy-build a pool of ``_AFWorker`` instances pinned to ``af_gpu_ids``.
 
-        When ``use_template`` is set, also runs the one-shot template init on each
-        worker (NBB2-fold the seed once, combine with antigen, then init each worker).
+        When ``template_pdb`` is set, also runs the one-shot template init on
+        each worker so per-candidate predicts are pure forward passes.
         """
         if self._workers or not self.af_gpu_ids:
             return
@@ -537,81 +439,32 @@ class AbAF2RewardCal:
                 antigen_pdb=self.antigen_pdb,
                 antigen_chain=self.antigen_chain,
                 binder_chain=self._binder_chain,
+                hotspot=self.hotspot,
             )
             for dev in picked
         ]
+        if self.template_pdb is not None:
+            logging.info(
+                f"[AF2] Templating {len(self._workers)} workers from "
+                f"{self.template_pdb} (rm_binder={self.rm_binder_positions}, "
+                f"hotspot={self.hotspot})"
+            )
+            for w in self._workers:
+                w.init_template(self.template_pdb, self.rm_binder_positions)
 
-        if self.use_template:
-            combined_pdb = self._build_template_pdb()
-            rm_binder_str = self._cdr_position_string()
-            ab_len = len(self.seed_sequence)
-            try:
-                logging.info(
-                    f"[AF2] Templating {len(self._workers)} workers (rm_binder={rm_binder_str})"
-                )
-                for w in self._workers:
-                    w.init_template(combined_pdb, rm_binder_str, ab_len)
-            finally:
-                try:
-                    os.remove(combined_pdb)
-                except OSError:
-                    pass
-
-    def _build_template_pdb(self) -> str:
-        """One-shot: NBB2-fold seed sequence, combine with antigen, write to a temp PDB.
-
-        Returns the temp file path. Caller is responsible for removing it.
-        """
-        if not self.seed_sequence:
-            raise ValueError("Templating requires a seed sequence.")
-        binder_pdb_str = self._fold_binder_with_nbb2(self.seed_sequence)
-        combined_pdb_str = _combine_target_and_binder_pdb(
-            target_pdb_path=self.antigen_pdb,
-            binder_pdb_str=binder_pdb_str,
-            target_chain=self.antigen_chain,
-            binder_chain=self._binder_chain,
-        )
-        with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tmp:
-            tmp.write(combined_pdb_str)
-            return tmp.name
-
-    def _cdr_position_string(self) -> str:
-        """colabdesign-format CDR positions for ``rm_binder``, e.g. 'H97,H98,...'.
-
-        Indices in ``self.cdr_indices`` are 0-based positions in the antibody sequence;
-        colabdesign expects ``<chain><1-based-resnum>`` strings.
-        """
-        if not self.cdr_indices:
-            return ""
-        return ",".join(f"{self._binder_chain}{i + 1}" for i in self.cdr_indices)
-
-    def _ensure_nbb2(self) -> None:
-        """Lazy-build the NBB2 model on first use."""
-        if self._nbb2_model is not None:
-            return
-        NBB2 = _lazy_import_nbb2()
-        os.makedirs(self.nbb2_weights_dir, exist_ok=True)
-        logging.info(f"[NBB2] Loading NanoBodyBuilder2 from {self.nbb2_weights_dir}")
-        self._nbb2_model = NBB2(numbering_scheme="raw", weights_dir=self.nbb2_weights_dir)
-
-    def _init_serial_template(self) -> None:
-        """One-shot template init for the serial-mode AF model.
-
-        Builds ``self._complex_model`` once, NBB2-folds the seed sequence, combines with
-        the antigen, and calls ``_prep_binder`` with ``rm_binder=<CDR positions>`` so the
-        binder framework template is preserved while CDR positions are re-hallucinated.
-        """
-        if self._template_initialized_serial:
+    # --------------------------------------------------------
+    # Serial-mode prediction (single-GPU / no af_gpu_ids)
+    # --------------------------------------------------------
+    def _ensure_serial_template(self) -> None:
+        """One-shot templated binder-model build for the serial path."""
+        if self._serial_template_initialized:
             return
         mk_model, clear_mem = _lazy_import_colabdesign()
         if self._complex_model is not None:
             clear_mem()
-
-        ab_len = len(self.seed_sequence)
-        rm_binder_str = self._cdr_position_string()
         logging.info(
-            f"[AF2] One-shot template init (serial): ab_len={ab_len}, "
-            f"rm_binder={rm_binder_str}"
+            f"[AF2] Serial template init from {self.template_pdb} "
+            f"(rm_binder={self.rm_binder_positions}, hotspot={self.hotspot})"
         )
         self._complex_model = mk_model(
             protocol="binder",
@@ -620,72 +473,45 @@ class AbAF2RewardCal:
             use_multimer=self.use_multimer,
             num_recycles=self.num_recycles,
         )
-
-        combined_pdb = self._build_template_pdb()
-        try:
-            self._complex_model._prep_binder(
-                pdb_filename=combined_pdb,
-                chain=self.antigen_chain,
-                binder_chain=self._binder_chain,
-                hotspot=None,
-                seed=0,
-                rm_target=False,
-                rm_target_seq=False,
-                rm_target_sc=False,
-                rm_template_ic=True,
-                rm_binder=rm_binder_str,
-                rm_binder_seq=True,
-                rm_binder_sc=True,
-            )
-        finally:
-            try:
-                os.remove(combined_pdb)
-            except OSError:
-                pass
-
-        self._complex_binder_len = ab_len
+        self._complex_model._prep_binder(
+            pdb_filename=self.template_pdb,
+            chain=self.antigen_chain,
+            binder_chain=self._binder_chain,
+            hotspot=self.hotspot,
+            seed=0,
+            rm_target=False,
+            rm_target_seq=False,
+            rm_target_sc=False,
+            rm_template_ic=True,
+            rm_binder=self.rm_binder_positions,
+            rm_binder_seq=self.rm_binder_positions,
+            rm_binder_sc=self.rm_binder_positions,
+        )
         self._complex_target_len = int(self._complex_model._target_len)
-        self._template_initialized_serial = True
+        self._complex_binder_len = int(self._complex_model._binder_len)
+        self._serial_template_initialized = True
 
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-    def _fold_binder_with_nbb2(self, ab_seq: str) -> str:
-        """Fold antibody sequence with NBB2 and return the PDB as a string."""
-        self._ensure_nbb2()
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            import torch
-            with torch.no_grad():
-                nb = self._nbb2_model.predict({"H": ab_seq})
-            nb.save(tmp_path)
-            with open(tmp_path, "r") as f:
-                return f.read()
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+    def _ensure_monomer_model(self, ab_len: int) -> None:
+        mk_model, clear_mem = _lazy_import_colabdesign()
+        if self._monomer_model is None or self._monomer_len != ab_len:
+            if self._monomer_model is not None:
+                clear_mem()
+            logging.info(
+                f"[AF2] Building hallucination/monomer model "
+                f"(recycles={self.num_recycles}, ab_len={ab_len})"
+            )
+            self._monomer_model = mk_model(
+                protocol="hallucination",
+                use_templates=False,
+                num_recycles=self.num_recycles,
+                data_dir=self.af_params_dir,
+                use_multimer=False,
+            )
+            self._monomer_model._prep_hallucination(length=ab_len)
+            self._monomer_len = ab_len
 
     def _predict_complex(self, ab_seq: str) -> dict:
-        if self.use_template:
-            return self._predict_complex_templated(ab_seq)
-        self._ensure_complex_model(len(ab_seq))
-        self._complex_model.predict(seq=ab_seq, models=self.af_models, verbose=False)
-        # Pull a shallow copy so downstream mutations don't poison the model state.
-        aux = dict(self._complex_model.aux)
-        aux["log"] = dict(self._complex_model.aux.get("log", {}))
-        aux["_pdb_str"] = self._complex_model.save_pdb()
-        return aux
-
-    def _predict_complex_templated(self, ab_seq: str) -> dict:
-        """Templated complex predict (serial mode).
-
-        On first call, runs the one-shot template init (NBB2-fold seed + combine +
-        prep_binder with CDR mask). After that, each call is just an AF2 forward pass.
-        """
-        self._init_serial_template()
+        self._ensure_serial_template()
         self._complex_model.predict(seq=ab_seq, models=self.af_models, verbose=False)
         aux = dict(self._complex_model.aux)
         aux["log"] = dict(self._complex_model.aux.get("log", {}))
@@ -720,8 +546,6 @@ class AbAF2RewardCal:
         ``binder_offset`` is the residue index where the binder starts inside
         ``complex_aux`` (== target_len when complex is in use, 0 for monomer-only).
         """
-        # Prefer the complex aux for confidence metrics whenever available; AF2
-        # multimer plddt over the binder slice is directly comparable to monomer plddt.
         conf_aux = complex_aux if complex_aux is not None else monomer_aux
         ab_len = len(sequence_str) if sequence_str else None
 
@@ -731,7 +555,6 @@ class AbAF2RewardCal:
         results: List[float] = []
         for metric in metrics_name:
             if metric == "ptm":
-                # In binder protocol pTM is overall complex pTM; for monomer it's plain pTM.
                 results.append(af2_to_ptm(conf_aux))
             elif metric == "plddt":
                 results.append(af2_to_plddt(conf_aux, binder_offset=binder_offset, binder_len=ab_len))
@@ -796,7 +619,6 @@ class AbAF2RewardCal:
             sc_output_dir = os.path.join(self.pdb_save_path, self.run_name)
             os.makedirs(sc_output_dir, exist_ok=True)
 
-            # Decode tokens to sequence strings using the loss mask.
             ab_sequences: List[str] = []
             for _it, ssp in enumerate(S_sp):
                 seq_string = "".join(
@@ -805,7 +627,6 @@ class AbAF2RewardCal:
                 ab_sequences.append(seq_string)
             n_seqs_this_call = len(ab_sequences)
 
-            # Multi-GPU dispatch when af_gpu_ids has 2+ devices.
             if self.af_gpu_ids and len(self.af_gpu_ids) > 1:
                 return self._reward_metrics_parallel(
                     protein_name=protein_name,
@@ -825,11 +646,9 @@ class AbAF2RewardCal:
                 sc_output_dir=sc_output_dir,
             )
         finally:
-            # JAX device pinning (with jax.default_device(devices[3])) and NBB2's
-            # internal torch ops both call cudaSetDevice as a side effect, leaving
-            # torch.cuda.current_device() pointing at whichever GPU the AF worker
-            # last touched. Restore to 0 here so the diffusion model's subsequent
-            # forward passes don't allocate fresh tensors on the wrong device.
+            # JAX device pinning + JAX/CUDA init may shift torch.cuda.current_device()
+            # at the OS level. Restore it so the diffusion model's subsequent forward
+            # passes don't allocate fresh tensors on the wrong device.
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -849,12 +668,10 @@ class AbAF2RewardCal:
         add_info: str,
         sc_output_dir: str,
     ):
-        """Serial single-GPU reward path. Extracted from reward_metrics for clarity."""
         record_reward: List[List[float]] = []
         record_reward_agg: List[float] = []
 
         for _it, ab_seq in enumerate(ab_sequences):
-            # Run AF2 prediction(s) for this single sequence.
             complex_aux: Optional[dict] = None
             monomer_aux: Optional[dict] = None
             binder_offset = 0
@@ -869,7 +686,6 @@ class AbAF2RewardCal:
                 pdb_str = monomer_aux["_pdb_str"]
                 binder_offset = 0
 
-            # Persist PDB output (always written; cheap and useful for debugging).
             pdb_path = os.path.join(sc_output_dir, f"{protein_name}{_it}_{add_info}.pdb")
             if save_pdb:
                 with open(pdb_path, "w") as ff:
@@ -879,7 +695,6 @@ class AbAF2RewardCal:
                     f.write(f">{protein_name}\n{ab_seq}\n")
                 pdb_for_metrics: object = pdb_path
             else:
-                # Hand the raw PDB string to PDB-based metrics; they wrap it in StringIO.
                 pdb_for_metrics = pdb_str
 
             all_reward = self.metrics_cal(
@@ -910,17 +725,14 @@ class AbAF2RewardCal:
         """Multi-GPU variant of reward_metrics. Dispatches AF predicts across workers."""
         from concurrent.futures import ThreadPoolExecutor
 
-        # _ensure_workers does the one-shot NBB2 fold + combine + per-worker template
-        # init when use_template is set, so by the time we get here every worker is
-        # ready and per-candidate predicts are pure forward passes.
         self._ensure_workers()
         n_workers = len(self._workers)
 
         # Dispatch SHARDS (one task per worker) rather than one task per sequence.
         # Each AF model mutates internal state (model.aux) on every predict() call;
         # if two ThreadPoolExecutor threads land on the same worker concurrently,
-        # one thread's aux read can capture the other thread's prediction. Sharding
-        # guarantees at most one in-flight predict per worker.
+        # one thread's aux read can capture the other thread's prediction.
+        # Sharding guarantees at most one in-flight predict per worker.
         shards: List[List[int]] = [[] for _ in range(n_workers)]
         for i in range(len(ab_sequences)):
             shards[i % n_workers].append(i)
