@@ -916,19 +916,37 @@ class AbAF2RewardCal:
         self._ensure_workers()
         n_workers = len(self._workers)
 
-        def _task(idx: int):
-            worker = self._workers[idx % n_workers]
-            ab_seq = ab_sequences[idx]
-            if self.needs_complex:
-                aux, target_len = worker.predict_complex(ab_seq)
-                return idx, aux, None, target_len
-            else:
-                aux = worker.predict_monomer(ab_seq)
-                return idx, None, aux, 0
+        # Dispatch SHARDS (one task per worker) rather than one task per sequence.
+        # Each AF model mutates internal state (model.aux) on every predict() call;
+        # if two ThreadPoolExecutor threads land on the same worker concurrently,
+        # one thread's aux read can capture the other thread's prediction. Sharding
+        # guarantees at most one in-flight predict per worker.
+        shards: List[List[int]] = [[] for _ in range(n_workers)]
+        for i in range(len(ab_sequences)):
+            shards[i % n_workers].append(i)
+
+        def _shard_task(worker_idx: int, idx_list: List[int]):
+            worker = self._workers[worker_idx]
+            out = []
+            for idx in idx_list:
+                ab_seq = ab_sequences[idx]
+                if self.needs_complex:
+                    aux, target_len = worker.predict_complex(ab_seq)
+                    out.append((idx, aux, None, target_len))
+                else:
+                    aux = worker.predict_monomer(ab_seq)
+                    out.append((idx, None, aux, 0))
+            return out
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(_task, i) for i in range(len(ab_sequences))]
-            results = sorted([f.result() for f in futures], key=lambda x: x[0])
+            futures = [
+                executor.submit(_shard_task, w, shards[w])
+                for w in range(n_workers) if shards[w]
+            ]
+            all_results = []
+            for f in futures:
+                all_results.extend(f.result())
+        results = sorted(all_results, key=lambda x: x[0])
 
         record_reward: List[List[float]] = []
         record_reward_agg: List[float] = []
