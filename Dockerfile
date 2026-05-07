@@ -41,6 +41,12 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
 # Copy the rest of the repo. Heavy stuff above is already cached.
 COPY . /home/
 
+# Install mber-open editable so AbAF2RewardCal can import the AFModel subclass
+# (mber-open's _prep_binder is what parses string-position rm_binder masks).
+RUN . /opt/conda/etc/profile.d/conda.sh && \
+    conda activate RERD && \
+    pip install --no-cache-dir -e /home/mber-open
+
 ENV PYTHONPATH=/home
 ENTRYPOINT ["/home/scripts/entrypoint.sh"]
 CMD ["python", "ab_refinement.py", "--help"]

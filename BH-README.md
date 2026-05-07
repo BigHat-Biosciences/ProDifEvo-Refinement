@@ -64,6 +64,13 @@ the `cuda12` extras to the already-pinned `jax==0.5.2`):
 pip install "jax[cuda12]==0.5.2"
 ```
 
+Finally, install mber-open (vendored at ``mber-open/``) editable so the AF2
+reward backend can import its ``AFModel`` subclass:
+
+```bash
+pip install -e mber-open/
+```
+
 ANARCI (used for CDR numbering when `--auto_number` is True, the default)
 shells out to the `hmmscan` binary from the HMMER suite, which is not pulled
 in by pip. Install it via bioconda:

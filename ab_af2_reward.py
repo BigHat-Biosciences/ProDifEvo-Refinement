@@ -1,17 +1,19 @@
 """AlphaFold2.3-multimer reward backend for antibody CDR design.
 
-Bonobo-style: the binder template is supplied as a pre-made multi-chain PDB
-(target chain + binder chain on disk). No NBB2 binder pre-folding at runtime.
-Build templates offline with ``scripts/generate_template.py`` (the only place
-NBB2 is invoked).
+Bonobo-style: uses mber-open's ``AFModel`` (subclass of colabdesign's
+mk_af_model with mber-open mixins) so string-position rm_binder/seq/sc args
+are parsed as binder-chain positions to mask. The binder template is supplied
+as a pre-made multi-chain PDB (target chain + binder chain on disk). No NBB2
+binder pre-folding at runtime. Build templates offline with
+``scripts/generate_template.py`` (the only place NBB2 is invoked).
 
 Two underlying models are constructed lazily:
 
-* ``mk_afdesign_model(protocol="binder", use_multimer=True)`` for predicting
-  the antibody:antigen complex (used when ``iptm`` is requested). Requires a
+* ``AFModel(protocol="binder", use_multimer=True)`` for predicting the
+  antibody:antigen complex (used when ``iptm`` is requested). Requires a
   ``template_pdb`` path containing target + binder.
-* ``mk_afdesign_model(protocol="hallucination", use_multimer=False)`` for
-  predicting the antibody monomer (used when no antigen is involved).
+* ``AFModel(protocol="hallucination", use_multimer=False)`` for predicting
+  the antibody monomer (used when no antigen is involved).
 
 AF2 is not batchable — each candidate sequence is predicted sequentially per
 worker. Multi-GPU is supported via ``af_gpu_ids``: one ``_AFWorker`` per GPU,
@@ -35,26 +37,32 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-# colabdesign is jax-based; importing it eagerly would be costly and would
-# fail on environments where AF2 is not yet installed. Defer to first use.
+# Use mber-open's AFModel (subclass of colabdesign's mk_af_model with mber-open
+# mixins) instead of stock colabdesign. The mber-open ``_prep_binder`` override
+# is what parses string-position rm_binder/rm_binder_seq/rm_binder_sc args
+# (e.g. "H27,H28,...") as a list of binder-chain positions to mask.
+# Stock colabdesign would treat a truthy string as ``True`` (mask all binder),
+# producing materially different AF predictions. Bonobo also uses AFModel.
 _AF_FACTORY = None
 _CLEAR_MEM = None
 
 
 def _lazy_import_colabdesign():
-    """Import colabdesign on first use, surfacing a clear install hint if missing."""
+    """Import the mber-open AFModel + colabdesign clear_mem on first use."""
     global _AF_FACTORY, _CLEAR_MEM
     if _AF_FACTORY is not None:
         return _AF_FACTORY, _CLEAR_MEM
     try:
-        from colabdesign import mk_afdesign_model, clear_mem
+        from mber.models.colabdesign.model import AFModel
+        from colabdesign import clear_mem
     except ImportError as e:
         raise ImportError(
-            "colabdesign is required for the AF2 reward backend. Install with:\n"
+            "mber + colabdesign are required for the AF2 reward backend. Install with:\n"
+            "  pip install -e mber-open/\n"
             "  pip install 'colabdesign @ git+https://github.com/sokrypton/ColabDesign.git@d024c4e'\n"
             "and ensure jax/flax are installed (see requirements.txt)."
         ) from e
-    _AF_FACTORY = mk_afdesign_model
+    _AF_FACTORY = AFModel
     _CLEAR_MEM = clear_mem
     return _AF_FACTORY, _CLEAR_MEM
 
