@@ -163,7 +163,7 @@ def launch_one(
     iteration: int = 10,
     af_models: str = "0",
     af_gpu_ids: str = "1,2,3",
-    seed: int = 0,
+    seed: int = 1776,
     run_name: str = "rerd_run",
     image_tag: str = "latest",
     timeout_hours: int = 24,
@@ -226,7 +226,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repeatnum", type=int, default=100)
     p.add_argument("--duplicate", type=int, default=5)
     p.add_argument("--iteration", type=int, default=10)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=1776,
+                   help="Seed passed to ab_refinement.py. Default 1776 matches "
+                        "bonobo's eval_compiled_final_iptm.py for parity.")
     p.add_argument("--run-name", default="rerd_run")
     p.add_argument("--image-tag", default="latest")
     return p.parse_args()
