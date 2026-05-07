@@ -17,7 +17,7 @@ class _mber_af_loss(_af_loss):
 ###
 
 # Define radius of gyration loss for colabdesign
-def add_rg_loss(self, weight=0.1):
+def add_rg_loss(self, weight=0.1, use_softplus=False):
     """add radius of gyration loss"""
 
     def loss_fn(inputs, outputs):
@@ -28,6 +28,10 @@ def add_rg_loss(self, weight=0.1):
         rg_th = 2.38 * ca.shape[0] ** 0.365
 
         rg = jax.nn.elu(rg - rg_th)
+
+        if use_softplus:
+            rg = jax.nn.softplus(rg)
+
         return {"rg": rg}
 
     self._callbacks["model"]["loss"].append(loss_fn)
@@ -115,7 +119,7 @@ import jax.numpy as jnp
 from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.af.loss import get_dgram_bins
 
-def add_hbond_loss(self, weight=0.5):
+def add_hbond_loss(self, weight=0.5, use_softplus=False):
     """
     Add hydrogen bonding loss to encourage H-bonds at the interface.
     
@@ -194,6 +198,9 @@ def add_hbond_loss(self, weight=0.5):
         
         # Return negative mean of top k scores (negative because we're minimizing)
         hbond_loss = -jnp.mean(top_k_values)
+
+        if use_softplus:
+            hbond_loss = jax.nn.softplus(hbond_loss)
         
         aux.update({"hbond": hbond_loss})
 
@@ -203,7 +210,7 @@ def add_hbond_loss(self, weight=0.5):
     self.opt["weights"]["hbond"] = weight
 
 
-def add_salt_bridge_loss(self, weight=0.3):
+def add_salt_bridge_loss(self, weight=0.3, use_softplus=False):
     """
     Add salt bridge loss to encourage complementary charged residues at the interface.
     Salt bridges are electrostatic interactions between oppositely charged residues.
@@ -275,6 +282,9 @@ def add_salt_bridge_loss(self, weight=0.3):
         
         # Return negative mean (negative because we're minimizing)
         salt_bridge_loss = -jnp.mean(top_values)
+
+        if use_softplus:
+            salt_bridge_loss = jax.nn.softplus(salt_bridge_loss)
         
         aux.update({"salt_bridge": salt_bridge_loss})
 
