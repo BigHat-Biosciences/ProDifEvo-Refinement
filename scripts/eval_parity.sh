@@ -170,7 +170,6 @@ echo "Step 3/3: Side-by-side ipTM comparison"
 echo "=========================================================="
 python - <<PY
 import pandas as pd
-import os
 
 orig = pd.read_csv("$INPUT_SNAPSHOT")
 rerd = pd.read_csv("$RERD_EVAL_CSV")[["sequence", "final_iptm"]].rename(
@@ -180,31 +179,49 @@ bonobo = pd.read_csv("$BONOBO_EVAL_CSV")[["sequence", "final_iptm"]].rename(
     columns={"final_iptm": "iptm_bonobo"}
 )
 
-# If the input CSV already has an iptm column (e.g., it's a RERD design's
-# output.csv), preserve it; otherwise just compare the two evals.
 keep = ["sequence"]
-if "iptm" in orig.columns:
+has_orig_iptm = "iptm" in orig.columns
+if has_orig_iptm:
     keep.append("iptm")
 m = orig[keep].merge(rerd, on="sequence", how="inner").merge(bonobo, on="sequence", how="inner")
-m["delta_rerd_minus_bonobo"] = m["iptm_rerd"] - m["iptm_bonobo"]
+
+# Test 1: RERD self-consistency. Compares the iptm reported by the original
+# CSV (typically a design run's output.csv) to a fresh re-eval through
+# eval_iptm.py. Mean ~0 confirms multi-GPU dispatch is race-free.
+if has_orig_iptm:
+    m["delta_input_vs_rerd"] = m["iptm_rerd"] - m["iptm"]
+
+# Test 2: RERD <-> bonobo parity. Compares fresh RERD eval to fresh bonobo
+# eval on the same sequences. Mean ~0 confirms the iptm calculation conditioning
+# (template, hotspot, rm_binder, prep) is at parity with bonobo.
+m["delta_rerd_vs_bonobo"] = m["iptm_rerd"] - m["iptm_bonobo"]
 
 print()
 print(f"Sequences scored by both: {len(m)} / {len(orig)}")
 print()
-cols = ["iptm_rerd", "iptm_bonobo", "delta_rerd_minus_bonobo"]
-if "iptm" in m.columns:
-    cols = ["iptm"] + cols
+
+cols = []
+if has_orig_iptm:
+    cols += ["iptm", "iptm_rerd", "delta_input_vs_rerd"]
+cols += ["iptm_rerd", "iptm_bonobo", "delta_rerd_vs_bonobo"]
+# de-dup adjacent iptm_rerd if both tests are present
+if cols.count("iptm_rerd") > 1:
+    cols = cols[:cols.index("iptm_rerd") + 1] + [c for c in cols[cols.index("iptm_rerd") + 1:] if c != "iptm_rerd"]
 print("Per-row:")
 print(m[cols].to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
+
+def stats(s):
+    return f"mean={s.mean():+.4f}  std={s.std():.4f}  max={s.max():+.4f}  min={s.min():+.4f}"
+
 print()
-print("=== Distribution stats ===")
-d = m["delta_rerd_minus_bonobo"]
-print(f"  RERD - bonobo:  mean={d.mean():+.4f}  std={d.std():.4f}  "
-      f"max={d.max():+.4f}  min={d.min():+.4f}")
-if "iptm" in m.columns:
-    e = m["iptm_rerd"] - m["iptm"]
-    print(f"  RERD - input:   mean={e.mean():+.4f}  std={e.std():.4f}  "
-          f"max={e.max():+.4f}  min={e.min():+.4f}  (RERD self-consistency)")
+if has_orig_iptm:
+    print("=== Test 1: RERD self-consistency (input output.csv vs re-eval) ===")
+    print("    Tests for multi-GPU race-condition issues. Should be ~0.")
+    print(f"    delta_input_vs_rerd:   {stats(m['delta_input_vs_rerd'])}")
+    print()
+print("=== Test 2: RERD vs bonobo iptm parity ===")
+print("    Tests for iptm calculation parity (template/hotspot/rm_binder). Should be ~0.")
+print(f"    delta_rerd_vs_bonobo:  {stats(m['delta_rerd_vs_bonobo'])}")
 
 out = "${OUTPUT_ROOT}/comparison.csv"
 m.to_csv(out, index=False)
