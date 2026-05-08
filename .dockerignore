@@ -1,0 +1,22 @@
+.git
+.gitignore
+.idea
+__pycache__
+*.pyc
+.pytest_cache
+
+# Run logs and intermediate outputs — never want these in the image.
+log/
+**/log/
+*.log
+
+# Diagnostic scripts and the on-host run script — not needed at runtime.
+diag_*.sh
+run_ab_binding.sh
+
+# Optional weights cache from local development; the image builds its own.
+.mber/
+
+# Editor / OS detritus
+.DS_Store
+*.swp
