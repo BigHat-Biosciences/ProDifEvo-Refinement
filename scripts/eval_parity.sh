@@ -230,7 +230,7 @@ m = (
     .merge(vidd, on="sequence", how="inner")
 )
 
-# Test 1 (only meaningful if input CSV already has an `iptm` column, e.g. when
+# Test 1 (only meaningful if input CSV already has an 'iptm' column, e.g. when
 # re-evaluating a design output.csv): compares input iptm to fresh RERD eval.
 # Mean ~0 confirms the multi-GPU dispatch is race-free.
 if has_orig_iptm:

@@ -10,10 +10,10 @@ DEST_DIR="${HOME}/Downloads"
 mkdir -p "$DEST_DIR"
 
 declare -A JOBS=(
-    [pdl1]=rerd-antibody-container-run-2026-05-05-20-59-31-954
-    [bhrf1]=rerd-antibody-container-run-2026-05-05-20-50-50-366
-    [il3]=rerd-antibody-container-run-2026-05-05-20-51-05-692
-    [il20]=rerd-antibody-container-run-2026-05-05-20-51-20-616
+    [pdl1]=rerd-antibody-container-run-2026-05-07-19-21-48-238
+    [bhrf1]=rerd-antibody-container-run-2026-05-07-19-22-03-696
+    [il3]=rerd-antibody-container-run-2026-05-07-19-22-17-831
+    [il20]=rerd-antibody-container-run-2026-05-07-19-46-25-763
 )
 
 for TARGET in pdl1 bhrf1 il3 il20; do
