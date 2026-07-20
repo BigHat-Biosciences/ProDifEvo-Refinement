@@ -68,12 +68,9 @@ re-eval (race check, ~0 = no race), **T2** RERD vs bonobo (conditioning
 parity), **T3** RERD vs VIDD (reward-backend parity), **T4** VIDD vs bonobo
 (end-to-end). "At parity" = all four means ≈ 0 within the noise floor.
 
-## Current status (as of the last work session, ~May 8)
+## Current status (as of the last work session)
 
-- **RERD design runs are done** for all 4 targets (100 binders each), generated
-  on SageMaker **after** all parity/race/seed fixes landed — i.e. at repo HEAD,
-  so they're valid inputs. Design-time ipTM: il20 best (mean 0.71), then pdl1
-  (0.61), il3 (0.50), **bhrf1 hardest (0.43, only 1/100 ≥ 0.7)**.
+- **RERD design runs are in progress** still running. 
 - **VIDD runs** were done locally on the GPU box for all 4 targets.
 - **The parity comparison itself was mid-run and never captured.** The
   consolidated 4-target × 3-method table (the actual deliverable) does not exist
