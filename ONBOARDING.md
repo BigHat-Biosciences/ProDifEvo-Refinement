@@ -57,16 +57,20 @@ Three distinct issues, all in `ProDifEvo-Refinement`:
 
 | Script | Purpose |
 |---|---|
-| `eval_parity.sh` | Score a CSV through **all three** evaluators (RERD `eval_iptm.py`, bonobo `eval_compiled_final_iptm.py`, VIDD `scripts/eval_iptm.py`) → `comparison.csv` + 4 delta tests. No design loop. |
+| `eval_parity.sh` | Compare a baseline's design-time reward `iptm` to bonobo's `final_iptm` (the only reported metric). Two tests: **[CRITICAL]** reward-vs-bonobo, **[CYA]** race check. Lives in **both** RERD and VIDD; each needs only its own env + bonobo. No design loop. |
 | `eval_parity_all.sh` | `fetch_outputs.sh` from S3 + loop `eval_parity.sh` over all 4 targets. |
 | `eval_e2e_parity.sh` | Small RERD design → re-eval w/ RERD → re-eval w/ bonobo (three-way, end-to-end). |
 | `diag_singlegpu_bias.sh` / `diag_multigpu_bias.sh` | Prove the race is gone: single-GPU Δ≈0, multi-GPU mean≈0 / max<0.01. |
 | `eval_noise_floor.sh` | Score same seqs twice → AF2 noise floor. |
 
-`eval_parity.sh` Step 4 emits four delta tests: **T1** design-ipTM vs RERD
-re-eval (race check, ~0 = no race), **T2** RERD vs bonobo (conditioning
-parity), **T3** RERD vs VIDD (reward-backend parity), **T4** VIDD vs bonobo
-(end-to-end). "At parity" = all four means ≈ 0 within the noise floor.
+`eval_parity.sh` (in **both** RERD and VIDD) emits two tests: **A [CRITICAL]**
+design-time reward `iptm` vs bonobo `final_iptm` — does the reward the model
+optimized match the metric we report (~0 = parity); **B [CYA]** design reward
+vs a fresh re-eval — race check (~0 = no multi-GPU race; skip with
+`RUN_RACE_CHECK=0`). Final ipTM is computed by bonobo **only**, so the old
+3-way cross-evaluator comparison (RERD-eval vs VIDD-eval vs bonobo-eval) was
+removed as extraneous. The reward AF-config (hotspot / rm_binder / static
+template) is already aligned to bonobo's eval, so Test A should read ~0.
 
 ## Current status (as of the last work session)
 
