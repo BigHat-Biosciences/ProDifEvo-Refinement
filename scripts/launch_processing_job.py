@@ -34,8 +34,10 @@ from typing import Optional, Tuple
 
 from sagemaker.processing import ProcessingInput, ProcessingOutput
 
-from bh.aicore.config import SAGEMAKER_GPU_MEDIUM_INSTANCE_TYPE
-from bh.aicore.training.sage import launch_container_on_sagemaker
+from bh.aws_tools.sagemaker import (
+    SAGEMAKER_GPU_MEDIUM_INSTANCE_TYPE,
+    launch_container_on_sagemaker,
+)
 
 
 # /opt/ml/processing/* layout follows SageMaker's default convention.
