@@ -114,6 +114,7 @@ def build_command(
     hotspot: Optional[str],
     antibody_sequence: str,
     cdrs_to_design: str,
+    cdr_indices: Optional[str],
     metrics_name: str,
     metrics_list: str,
     repeatnum: int,
@@ -148,6 +149,8 @@ def build_command(
     """
     if hotspot:
         cmd += f" --hotspot {hotspot}"
+    if cdr_indices:
+        cmd += f" --cdr_indices {cdr_indices}"
     return [seg for line in cmd.splitlines() for seg in line.strip().split(" ") if seg]
 
 
@@ -158,6 +161,7 @@ def launch_one(
     template_s3_uri: Optional[str] = None,
     hotspot: Optional[str] = None,
     cdrs_to_design: str = "H1,H2,H3",
+    cdr_indices: Optional[str] = None,
     metrics_name: str = "iptm,cdr_plddt,plddt",
     metrics_list: str = "3,1,1",
     repeatnum: int = 100,
@@ -188,6 +192,7 @@ def launch_one(
         hotspot=resolved_hotspot,
         antibody_sequence=antibody_sequence,
         cdrs_to_design=cdrs_to_design,
+        cdr_indices=cdr_indices,
         metrics_name=metrics_name,
         metrics_list=metrics_list,
         repeatnum=repeatnum,
@@ -225,6 +230,10 @@ def parse_args() -> argparse.Namespace:
                    help="Override the hotspot string. For baked targets this "
                         "defaults to the per-target value (e.g. pdl1 -> A113).")
     p.add_argument("--cdrs-to-design", default="H1,H2,H3")
+    p.add_argument("--cdr-indices", default=None,
+                   help="Manual 0-based CDR indices, e.g. '26-34,47-57,95-106'. "
+                        "Overrides ANARCI auto-numbering; freezes the framework to "
+                        "exactly the complement of these positions.")
     p.add_argument("--repeatnum", type=int, default=100)
     p.add_argument("--duplicate", type=int, default=5)
     p.add_argument("--iteration", type=int, default=10)
@@ -244,6 +253,7 @@ if __name__ == "__main__":
         template_s3_uri=args.template_s3_uri,
         hotspot=args.hotspot,
         cdrs_to_design=args.cdrs_to_design,
+        cdr_indices=args.cdr_indices,
         repeatnum=args.repeatnum,
         duplicate=args.duplicate,
         iteration=args.iteration,
