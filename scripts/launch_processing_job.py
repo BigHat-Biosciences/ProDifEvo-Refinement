@@ -178,6 +178,89 @@ echo "[overlay] exec: $*"
 exec "$@"
 """)
 
+    # Outer replicate loop: run the ENTIRE original inference over and over until
+    # the wall-clock budget is gone, rather than inflating repeatnum to some
+    # guessed value. Every replicate uses hyperparameters identical to the
+    # original 100-sequence run; only the seed moves, because re-running a
+    # deterministic pipeline with a fixed seed would just reproduce the same 100
+    # designs. Seeds are BASE+index so the set is reproducible and auditable.
+    with open(os.path.join(staged, "replicate_loop.sh"), "w") as fh:
+        fh.write(f"""#!/bin/bash
+set -uo pipefail
+OUT_ROOT={CONTAINER_OUTPUT_DIR}
+BUDGET="${{RERD_WALLCLOCK_SECONDS:?}}"
+BASE_SEED="${{RERD_BASE_SEED:?}}"
+RUN_NAME="${{RERD_RUN_NAME:?}}"
+RESERVE="${{RERD_FINAL_EVAL_RESERVE:-1800}}"
+START=$(date +%s)
+END=$((START + BUDGET))
+MANIFEST="$OUT_ROOT/replicates.tsv"
+mkdir -p "$OUT_ROOT"
+printf 'replicate\\tseed\\tstatus\\tstarted_utc\\twall_seconds\\tpartial\\n' > "$MANIFEST"
+
+i=0
+longest=0
+while :; do
+  now=$(date +%s)
+  remain=$((END - now))
+  if [ "$remain" -le 0 ]; then
+    echo "[replicate] budget exhausted after $i replicate(s)"
+    break
+  fi
+  # Refuse to start a replicate we cannot finish, UNLESS we have not banked one
+  # yet -- a run that produces nothing is worse than one that overruns.
+  partial=0
+  extra=""
+  if [ "$longest" -gt 0 ] && [ "$remain" -lt "$longest" ]; then
+    if [ "$remain" -lt $((RESERVE * 2)) ]; then
+      echo "[replicate] ${{remain}}s left, too little for a useful partial; stopping"
+      break
+    fi
+    # Hand the leftover to a time-boxed replicate. It runs as many refinement
+    # iterations as fit and still writes a real output.csv, instead of the tail
+    # of the budget going to waste.
+    echo "[replicate] ${{remain}}s left < ${{longest}}s typical; running replicate $i time-boxed"
+    extra="--wallclock_seconds $remain --final_eval_reserve_seconds $RESERVE"
+    partial=1
+  fi
+
+  seed=$((BASE_SEED + i))
+  rep_out="$OUT_ROOT/replicate_$(printf '%03d' $i)"
+  mkdir -p "$rep_out"
+  echo "[replicate] === replicate $i | seed $seed | ${{remain}}s left | partial=$partial ==="
+  t0=$(date +%s)
+  started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  set +e
+  python ab_refinement.py "$@" \\
+    --seed "$seed" \\
+    --run_name "${{RUN_NAME}}_rep$(printf '%03d' $i)" \\
+    --output_root "$rep_out" \\
+    $extra
+  rc=$?
+  set -e
+  t1=$(date +%s)
+  dur=$((t1 - t0))
+  if [ "$rc" -eq 0 ]; then
+    status=ok
+    # Only full replicates inform the fit prediction; a time-boxed one is short
+    # by construction and would make us over-optimistic about the next.
+    if [ "$partial" -eq 0 ] && [ "$dur" -gt "$longest" ]; then longest=$dur; fi
+  else
+    status="failed_rc$rc"
+    echo "[replicate] replicate $i FAILED rc=$rc after ${{dur}}s -- continuing to the next"
+  fi
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$i" "$seed" "$status" "$started" "$dur" "$partial" >> "$MANIFEST"
+  i=$((i + 1))
+  if [ "$partial" -eq 1 ]; then
+    echo "[replicate] time-boxed replicate done; budget spent"
+    break
+  fi
+done
+
+echo "[replicate] FINISHED. manifest:"
+cat "$MANIFEST"
+""")
+
     subprocess.run(["aws", "s3", "cp", "--recursive", "--quiet", staged, s3_prefix],
                    check=True)
     print("code overlay   : " + s3_prefix)
@@ -206,7 +289,17 @@ def build_command(
     run_name: str,
     wallclock_seconds: int = 0,
     final_eval_reserve_seconds: int = 1800,
+    replicate_mode: bool = False,
 ) -> list[str]:
+    # In replicate mode the outer loop owns --seed, --run_name and --output_root
+    # (they differ per replicate), so they are omitted here and supplied by the
+    # driver. Everything else -- the actual hyperparameters -- is identical
+    # across every replicate and identical to the original 100-sequence run.
+    per_replicate = "" if replicate_mode else f"""
+        --seed {seed}
+        --run_name {run_name}
+        --output_root {CONTAINER_OUTPUT_DIR}
+    """
     cmd = f"""
         ab_refinement.py
         --antibody_sequence {antibody_sequence}
@@ -224,16 +317,14 @@ def build_command(
         --num_recycles 3
         --af_models {af_models}
         --af_gpu_ids {af_gpu_ids}
-        --seed {seed}
-        --run_name {run_name}
-        --output_root {CONTAINER_OUTPUT_DIR}
+        {per_replicate}
         --template_pdb {template_container_path}
     """
     if hotspot:
         cmd += f" --hotspot {hotspot}"
     if cdr_indices:
         cmd += f" --cdr_indices {cdr_indices}"
-    if wallclock_seconds > 0:
+    if wallclock_seconds > 0 and not replicate_mode:
         cmd += (f" --wallclock_seconds {wallclock_seconds}"
                 f" --final_eval_reserve_seconds {final_eval_reserve_seconds}")
     return [seg for line in cmd.splitlines() for seg in line.strip().split(" ") if seg]
@@ -261,6 +352,7 @@ def launch_one(
     wallclock_seconds: int = 0,
     final_eval_reserve_seconds: int = 1800,
     overlay_s3_prefix: Optional[str] = None,
+    replicate_mode: bool = False,
 ):
     antigen_path, antigen_input = resolve_antigen(antigen)
     template_path, template_input = resolve_template(antigen, template_s3_uri)
@@ -297,7 +389,24 @@ def launch_one(
         run_name=run_name,
         wallclock_seconds=wallclock_seconds,
         final_eval_reserve_seconds=final_eval_reserve_seconds,
+        replicate_mode=replicate_mode,
     )
+    env = None
+    if replicate_mode:
+        if not wallclock_seconds:
+            raise ValueError("--replicate-mode requires --wallclock-hours")
+        if overlay_input is None:
+            raise ValueError(
+                "--replicate-mode needs --overlay-code-s3: the replicate driver is "
+                "staged alongside the code overlay, not baked into the image."
+            )
+        env = {
+            "RERD_WALLCLOCK_SECONDS": str(wallclock_seconds),
+            "RERD_BASE_SEED": str(seed),
+            "RERD_RUN_NAME": run_name,
+            "RERD_FINAL_EVAL_RESERVE": str(final_eval_reserve_seconds),
+        }
+
     if wallclock_seconds > 0:
         # Belt and braces (see below). ab_refinement stops itself at the budget, but if a
         # single iteration overruns its prediction the container must still be
@@ -306,9 +415,20 @@ def launch_one(
         # SageMaker's own timeout sits an hour further out so it is never what
         # ends a healthy run -- a SageMaker kill is a hard stop with no chance to
         # flush artifacts.
-        command = "timeout"
-        arguments = ["-s", "TERM", "-k", "120s", f"{wallclock_seconds}s", "python"] + cmd
-        timeout_in_seconds = wallclock_seconds + 3600
+        if replicate_mode:
+            # The replicate loop owns the budget and stops itself; this outer
+            # fence sits PAST it (budget + reserve) purely so a wedged replicate
+            # cannot hold the instance forever. cmd[0] is "ab_refinement.py",
+            # which the loop supplies itself, so only the flags are passed on.
+            fence = wallclock_seconds + final_eval_reserve_seconds
+            command = "timeout"
+            arguments = (["-s", "TERM", "-k", "300s", f"{fence}s", "bash",
+                          f"{CONTAINER_CODE_INPUT_DIR}/replicate_loop.sh"] + cmd[1:])
+            timeout_in_seconds = fence + 3600
+        else:
+            command = "timeout"
+            arguments = ["-s", "TERM", "-k", "120s", f"{wallclock_seconds}s", "python"] + cmd
+            timeout_in_seconds = wallclock_seconds + 3600
     else:
         command = "python"
         arguments = cmd
@@ -330,6 +450,7 @@ def launch_one(
         outputs=outputs,
         instance_type=SAGEMAKER_GPU_MEDIUM_INSTANCE_TYPE,
         timeout_in_seconds=timeout_in_seconds,
+        env=env,
     )
 
 
@@ -364,6 +485,12 @@ def parse_args() -> argparse.Namespace:
                    help="Wall-clock budget in hours. When set, the run is ended by "
                         "time rather than by --iteration (which becomes an upper "
                         "bound), matching the other baselines. 0 = disabled.")
+    p.add_argument("--replicate-mode", action="store_true",
+                   help="Run the WHOLE inference repeatedly until --wallclock-hours "
+                        "is spent, instead of scaling any single run's size. Every "
+                        "replicate uses hyperparameters identical to the original "
+                        "run; only the seed advances (BASE+index). Requires "
+                        "--wallclock-hours and --overlay-code-s3.")
     p.add_argument("--overlay-code-s3", default=None,
                    help="s3:// prefix to stage the current working copy of the "
                         "python sources to, and mount into the job. Lets a code "
@@ -393,4 +520,5 @@ if __name__ == "__main__":
         wallclock_seconds=int(args.wallclock_hours * 3600),
         final_eval_reserve_seconds=int(args.final_eval_reserve_minutes * 60),
         overlay_s3_prefix=args.overlay_code_s3,
+        replicate_mode=args.replicate_mode,
     )
