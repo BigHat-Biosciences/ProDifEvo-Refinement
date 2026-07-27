@@ -48,6 +48,22 @@ CONTAINER_OUTPUT_DIR = "/opt/ml/processing/output"
 CONTAINER_ANTIGEN_PDB = os.path.join(CONTAINER_ANTIGEN_INPUT_DIR, "antigen.pdb")
 CONTAINER_TEMPLATE_PDB = os.path.join(CONTAINER_TEMPLATE_INPUT_DIR, "template.pdb")
 
+CONTAINER_CODE_INPUT_DIR = os.path.join(CONTAINER_INPUT_DIR, "code")
+
+# Python sources that may be overlaid onto the baked image at launch time.
+# The image COPYs the repo to /home at build time, so without an overlay a code
+# change needs a full CUDA image rebuild (~an hour, and cross-arch from an arm64
+# laptop). Overlaying mirrors how the other baselines ship their drivers: edit,
+# relaunch, no rebuild. Keep this list to interpreted sources -- anything
+# compiled or pip-installed still needs a real rebuild.
+OVERLAY_SOURCES = [
+    "ab_refinement.py",
+    "ab_args_file.py",
+    "ab_af2_reward.py",
+    "ab_utils.py",
+    "evodiff/generate_antibody.py",
+]
+
 # PDBs baked into the image at build time. Keep in sync with datasets/.
 BAKED_DATASETS_DIR = "/home/datasets"
 BAKED_ANTIGENS = {"pdl1", "bhrf1", "il3", "il20"}
@@ -107,6 +123,70 @@ def resolve_hotspot(antigen: str, hotspot: Optional[str]) -> Optional[str]:
     return BAKED_HOTSPOTS.get(antigen)
 
 
+def build_overlay_input(repo_root: str, s3_prefix: str) -> ProcessingInput:
+    """Upload the current working copy of OVERLAY_SOURCES and mount it.
+
+    Uploads what is on disk, not what is committed, so an uncommitted fix still
+    reaches the job -- deliberate, since this exists to shorten the edit/launch
+    loop. The launcher prints the manifest so a run is always traceable to the
+    exact bytes it ran.
+    """
+    import hashlib
+    import subprocess
+    import tempfile
+
+    staged = tempfile.mkdtemp(prefix="rerd_overlay_")
+    manifest = []
+    for rel in OVERLAY_SOURCES:
+        src = os.path.join(repo_root, rel)
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"overlay source missing: {src}")
+        dst = os.path.join(staged, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(src, "rb") as fh:
+            body = fh.read()
+        with open(dst, "wb") as fh:
+            fh.write(body)
+        manifest.append(f"{hashlib.sha256(body).hexdigest()[:12]}  {rel}")
+
+    with open(os.path.join(staged, "OVERLAY_MANIFEST.txt"), "w") as fh:
+        fh.write("\n".join(manifest) + "\n")
+
+    # Copy the overlay over the baked tree, then exec the real command. This has
+    # to be a file rather than `bash -c "..."` because SageMaker caps each
+    # ContainerArguments member at 256 chars and the whole script would be one
+    # member. Args after the script path arrive as "$@", each comfortably short.
+    with open(os.path.join(staged, "run_rerd.sh"), "w") as fh:
+        fh.write(f"""#!/bin/bash
+set -euo pipefail
+CODE={CONTAINER_CODE_INPUT_DIR}
+if [ -f "$CODE/OVERLAY_MANIFEST.txt" ]; then
+  echo "[overlay] applying code overlay:"
+  cat "$CODE/OVERLAY_MANIFEST.txt"
+  cd "$CODE"
+  find . -name '*.py' -print0 | while IFS= read -r -d '' f; do
+    mkdir -p "/home/$(dirname "$f")"
+    cp "$f" "/home/$f"
+    echo "[overlay]   -> /home/${{f#./}}"
+  done
+  cd /
+else
+  echo "[overlay] no manifest found; running the image as baked"
+fi
+cd /home
+echo "[overlay] exec: $*"
+exec "$@"
+""")
+
+    subprocess.run(["aws", "s3", "cp", "--recursive", "--quiet", staged, s3_prefix],
+                   check=True)
+    print("code overlay   : " + s3_prefix)
+    for line in manifest:
+        print("                 " + line)
+    return ProcessingInput(source=s3_prefix, destination=CONTAINER_CODE_INPUT_DIR,
+                           input_name="code")
+
+
 def build_command(
     *,
     antigen_container_path: str,
@@ -124,6 +204,8 @@ def build_command(
     af_gpu_ids: str,
     seed: int,
     run_name: str,
+    wallclock_seconds: int = 0,
+    final_eval_reserve_seconds: int = 1800,
 ) -> list[str]:
     cmd = f"""
         ab_refinement.py
@@ -151,6 +233,9 @@ def build_command(
         cmd += f" --hotspot {hotspot}"
     if cdr_indices:
         cmd += f" --cdr_indices {cdr_indices}"
+    if wallclock_seconds > 0:
+        cmd += (f" --wallclock_seconds {wallclock_seconds}"
+                f" --final_eval_reserve_seconds {final_eval_reserve_seconds}")
     return [seg for line in cmd.splitlines() for seg in line.strip().split(" ") if seg]
 
 
@@ -173,12 +258,20 @@ def launch_one(
     run_name: str = "rerd_run",
     image_tag: str = "latest",
     timeout_hours: int = 24,
+    wallclock_seconds: int = 0,
+    final_eval_reserve_seconds: int = 1800,
+    overlay_s3_prefix: Optional[str] = None,
 ):
     antigen_path, antigen_input = resolve_antigen(antigen)
     template_path, template_input = resolve_template(antigen, template_s3_uri)
     resolved_hotspot = resolve_hotspot(antigen, hotspot)
 
     inputs = [x for x in (antigen_input, template_input) if x is not None]
+    overlay_input = None
+    if overlay_s3_prefix:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        overlay_input = build_overlay_input(repo_root, overlay_s3_prefix.rstrip("/"))
+        inputs.append(overlay_input)
     outputs = [
         ProcessingOutput(
             output_name="rerd_output",
@@ -202,16 +295,41 @@ def launch_one(
         af_gpu_ids=af_gpu_ids,
         seed=seed,
         run_name=run_name,
+        wallclock_seconds=wallclock_seconds,
+        final_eval_reserve_seconds=final_eval_reserve_seconds,
     )
+    if wallclock_seconds > 0:
+        # Belt and braces (see below). ab_refinement stops itself at the budget, but if a
+        # single iteration overruns its prediction the container must still be
+        # brought down cleanly: `timeout` sends SIGTERM at the budget (the driver
+        # catches it and winds up at the next boundary) and SIGKILL 120s later.
+        # SageMaker's own timeout sits an hour further out so it is never what
+        # ends a healthy run -- a SageMaker kill is a hard stop with no chance to
+        # flush artifacts.
+        command = "timeout"
+        arguments = ["-s", "TERM", "-k", "120s", f"{wallclock_seconds}s", "python"] + cmd
+        timeout_in_seconds = wallclock_seconds + 3600
+    else:
+        command = "python"
+        arguments = cmd
+        timeout_in_seconds = timeout_hours * 60 * 60
+
+    if overlay_input is not None:
+        # Run everything through the overlay wrapper, which applies the code
+        # then execs what follows (including the `timeout` prefix, so the
+        # wall-clock fence still wraps the real work).
+        arguments = [f"{CONTAINER_CODE_INPUT_DIR}/run_rerd.sh", command] + arguments
+        command = "bash"
+
     return launch_container_on_sagemaker(
         image_repo="rerd-antibody",
         image_tag=image_tag,
-        command="python",
-        arguments=cmd,
+        command=command,
+        arguments=arguments,
         inputs=inputs,
         outputs=outputs,
         instance_type=SAGEMAKER_GPU_MEDIUM_INSTANCE_TYPE,
-        timeout_in_seconds=timeout_hours * 60 * 60,
+        timeout_in_seconds=timeout_in_seconds,
     )
 
 
@@ -242,6 +360,18 @@ def parse_args() -> argparse.Namespace:
                         "bonobo's eval_compiled_final_iptm.py for parity.")
     p.add_argument("--run-name", default="rerd_run")
     p.add_argument("--image-tag", default="latest")
+    p.add_argument("--wallclock-hours", type=float, default=0.0,
+                   help="Wall-clock budget in hours. When set, the run is ended by "
+                        "time rather than by --iteration (which becomes an upper "
+                        "bound), matching the other baselines. 0 = disabled.")
+    p.add_argument("--overlay-code-s3", default=None,
+                   help="s3:// prefix to stage the current working copy of the "
+                        "python sources to, and mount into the job. Lets a code "
+                        "change reach the next run without rebuilding the CUDA "
+                        "image. Omit to run the image exactly as baked.")
+    p.add_argument("--final-eval-reserve-minutes", type=float, default=30.0,
+                   help="Minutes held back from the wall-clock budget for the final "
+                        "eval pass and artifact writing.")
     return p.parse_args()
 
 
@@ -260,4 +390,7 @@ if __name__ == "__main__":
         seed=args.seed,
         run_name=args.run_name,
         image_tag=args.image_tag,
+        wallclock_seconds=int(args.wallclock_hours * 3600),
+        final_eval_reserve_seconds=int(args.final_eval_reserve_minutes * 60),
+        overlay_s3_prefix=args.overlay_code_s3,
     )

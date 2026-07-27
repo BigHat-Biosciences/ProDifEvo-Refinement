@@ -32,6 +32,9 @@ def generate_oaardm_cdr_edit(
     iteration=30,
     edit_fraction=0.3,
     initial_sample=None,
+    deadline=None,
+    checkpoint_cb=None,
+    should_stop=None,
 ):
     """Reward-guided masked diffusion that only designs CDR positions.
 
@@ -52,9 +55,29 @@ def generate_oaardm_cdr_edit(
         device: torch device.
         cdr_indices: List of 0-based CDR position indices to design.
         framework_indices: List of 0-based framework position indices to keep fixed.
-        iteration: Number of refinement iterations.
+        iteration: Maximum number of refinement iterations. With `deadline` set
+            this is an upper bound, not the thing that ends the run.
         edit_fraction: Fraction of CDR positions to re-mask each iteration.
         initial_sample: Tokenized initial sequence tensor, shape (repeat_num, seq_len).
+        deadline: Optional `time.time()` value past which no NEW iteration is
+            started. Wall-clock mode. An iteration is only abandoned at its
+            boundary -- mid-iteration the sample still holds mask tokens at the
+            not-yet-unmasked CDR positions, so stopping there would emit
+            sequences containing 'X'. We also refuse to start an iteration we
+            predict cannot finish in time (see `_iter_fits`), because an
+            iteration that gets SIGTERMed halfway is wasted compute.
+            NOTE the first iteration is effectively uninterruptible: the deadline
+            is only consulted at boundaries, so a budget smaller than one
+            iteration still runs one to completion and overruns. The budget must
+            comfortably exceed the from-scratch iteration (~5h for RERD at
+            repeatnum=100), which is far below any 72h setting but matters for
+            smoke tests.
+        checkpoint_cb: Optional callable invoked at each iteration boundary as
+            checkpoint_cb(iteration_index, sequences, per_metric_rewards,
+            aggregate_rewards, metric_names). Used to dump usable results as we
+            go so a wall-clock kill still leaves a complete artifact.
+        should_stop: Optional zero-arg callable returning True when the run
+            should wind up at the next boundary (SIGTERM handler).
 
     Returns:
         sample: Final tokenized sequences, shape (repeat_num, seq_len).
@@ -83,7 +106,43 @@ def generate_oaardm_cdr_edit(
 
     pbar = tqdm(range(iteration), desc="Refinement iterations")
     timing_csv = os.path.join(folder_path, 'timing.csv')
-    for ttt in pbar:
+
+    # Wall-clock bookkeeping. iter_walls[0] is the from-scratch iteration, which
+    # costs ~3.5x a refinement iteration (it unmasks all `num_cdr` positions
+    # rather than `num_to_remask`), so it is a useless predictor of the rest.
+    # Predict from the refinement iterations only, and be pessimistic: use the
+    # slowest seen, not the mean, since overrunning the deadline loses the whole
+    # iteration while stopping early only forfeits a partial improvement.
+    iter_walls = []
+
+    def _stop_reason(next_ttt):
+        if should_stop is not None and should_stop():
+            return "signal"
+        if iteration is not None and next_ttt >= iteration:
+            return "max_iterations"
+        if deadline is not None:
+            now = time.time()
+            if now >= deadline:
+                return "deadline_reached"
+            refine_walls = iter_walls[1:] or iter_walls
+            if refine_walls:
+                predicted = max(refine_walls)
+                if now + predicted > deadline:
+                    return (f"deadline_would_overrun "
+                            f"(need ~{predicted:.0f}s, have {deadline - now:.0f}s)")
+        return None
+
+    ttt = -1
+    stop_reason = "max_iterations"
+    completed_sample = None
+    completed_iteration = -1
+    while True:
+        ttt += 1
+        reason = _stop_reason(ttt)
+        if reason is not None:
+            stop_reason = reason
+            break
+        pbar.update(1)
         iter_t0 = time.perf_counter()
         n_seqs_before = reward_model._timings["n_sequences"] if hasattr(reward_model, "_timings") else 0
 
@@ -202,11 +261,30 @@ def generate_oaardm_cdr_edit(
             if write_header_t:
                 writer.writerow(['iteration', 'wall_seconds', 'n_af_predictions', 'sec_per_af_prediction'])
             writer.writerow([ttt, f"{iter_wall:.3f}", n_preds_iter, f"{sec_per_pred:.3f}"])
+        iter_walls.append(iter_wall)
 
-        # Return on final iteration
-        if ttt == iteration - 1:
-            untokenized = [tokenizer.untokenize(s) for s in sample]
-            return sample, untokenized
+        # Snapshot BEFORE the resample/re-mask below. Once those run, `sample`
+        # holds mask tokens at the positions queued for the next iteration, so
+        # it is not a valid answer. The loop exits at the TOP, after this point,
+        # which means the thing we return must be captured here.
+        completed_sample = sample.clone()
+        completed_iteration = ttt
+
+        # Dump a usable snapshot at every boundary. Under a wall-clock budget the
+        # run is expected to be killed rather than to finish, so results that only
+        # exist at the end are results that never exist.
+        if checkpoint_cb is not None:
+            checkpoint_cb(
+                ttt,
+                [tokenizer.untokenize(s) for s in sample],
+                per_metric_rewards,
+                reward_hoge,
+                metric_names,
+            )
+
+        if deadline is not None:
+            print(f"Iteration {ttt} done; {deadline - time.time():.0f}s of wall-clock budget left",
+                  flush=True)
 
         # Reward-weighted resampling across the population
         reward_arr = np.array(reward_hoge)
@@ -228,6 +306,20 @@ def generate_oaardm_cdr_edit(
             for pos in loc_set[iii]:
                 sample[iii, pos] = mask
         sample = _enforce_framework(sample)
+
+    pbar.close()
+    if completed_sample is None:
+        raise RuntimeError(
+            "Refinement stopped before completing a single iteration "
+            f"(reason={stop_reason}). The wall-clock budget is too small to "
+            "produce any designs; nothing usable was generated."
+        )
+    print(f"Refinement finished after {completed_iteration + 1} iteration(s); "
+          f"reason={stop_reason}", flush=True)
+    logging.info("Refinement stop reason: %s after %d iteration(s)",
+                 stop_reason, completed_iteration + 1)
+    untokenized = [tokenizer.untokenize(s) for s in completed_sample]
+    return completed_sample, untokenized
 
 
 @torch.no_grad()

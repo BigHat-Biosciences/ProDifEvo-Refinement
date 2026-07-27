@@ -36,6 +36,7 @@ from evodiff.generate_antibody import generate_oaardm_cdr_edit, generate_oaardm_
 import os
 import datetime
 import logging
+import signal
 import time
 import warnings
 import numpy as np
@@ -164,6 +165,62 @@ if __name__ == "__main__":
         print(f"Antigen: {len(antigen_seq)} residues (binder design mode)")
     print(f"{'='*60}\n")
 
+    # ---- Wall-clock budget ----
+    # The refinement loop gets the budget MINUS a reserve, because the final
+    # evaluation pass and artifact writing happen after it returns. Spending the
+    # whole budget on refinement means SageMaker's `timeout` fires during the
+    # final eval and the run produces no output.csv at all.
+    deadline = None
+    if args.wallclock_seconds > 0:
+        refine_budget = args.wallclock_seconds - args.final_eval_reserve_seconds
+        if refine_budget <= 0:
+            raise ValueError(
+                f"--wallclock_seconds ({args.wallclock_seconds}) must exceed "
+                f"--final_eval_reserve_seconds ({args.final_eval_reserve_seconds})."
+            )
+        deadline = time.time() + refine_budget
+        print(f"Wall-clock mode: {args.wallclock_seconds}s total, "
+              f"{refine_budget}s for refinement, "
+              f"{args.final_eval_reserve_seconds}s reserved for final eval. "
+              f"--iteration {args.iteration} is an upper bound only.", flush=True)
+
+    # SIGTERM (what `timeout -s TERM` and SageMaker send) sets a flag rather than
+    # killing outright, so the run winds up at the next iteration boundary with
+    # its artifacts intact instead of dying mid-iteration.
+    _stop_requested = {"v": False}
+
+    def _on_sigterm(signum, _frame):
+        _stop_requested["v"] = True
+        print(f"Received signal {signum}; will stop at the next iteration boundary.",
+              flush=True)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
+
+    def _checkpoint(iter_idx, sequences, per_metric, agg, metric_names):
+        """Write a complete, self-describing snapshot each iteration.
+
+        Written to a temp file and renamed so a reader (or an interrupted
+        upload) never sees a half-written CSV, then fsync'd because SageMaker's
+        Continuous upload mode only ships closed, flushed files.
+        """
+        snap = pd.DataFrame(np.array(per_metric), columns=metric_names)
+        snap["aggregate_reward"] = agg
+        snap["sequence"] = sequences
+        snap["iteration"] = iter_idx
+        snap["cdr_indices"] = str(cdr_indices)
+        snap["framework_fixed"] = True
+        final_path = os.path.join(folder_path, "output_checkpoint.csv")
+        tmp_path = final_path + ".tmp"
+        with open(tmp_path, "w", newline="") as fh:
+            snap.to_csv(fh, index=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final_path)
+        # Append-only history so an interrupted run still shows its trajectory.
+        hist_path = os.path.join(folder_path, "output_checkpoint_history.csv")
+        snap.to_csv(hist_path, mode="a", header=not os.path.exists(hist_path), index=False)
+
     if args.decoding == "SVDD_edit":
         tokenized_sample, generated_sequence = generate_oaardm_cdr_edit(
             model, tokenizer, seq_len, ab_reward_model,
@@ -179,6 +236,9 @@ if __name__ == "__main__":
             iteration=args.iteration,
             edit_fraction=args.edit_fraction,
             initial_sample=S_initial,
+            deadline=deadline,
+            checkpoint_cb=_checkpoint,
+            should_stop=lambda: _stop_requested["v"],
         )
     elif args.decoding == "SVDD":
         tokenized_sample, generated_sequence = generate_oaardm_cdr_svdd(
@@ -297,9 +357,16 @@ if __name__ == "__main__":
     avg_s_per_pred = total_reward_s / max(total_preds, 1)
     sec_per_designed_binder = run_wall / max(repeat_num, 1)
 
+    iters_done = int(pd.read_csv(os.path.join(folder_path, "timing.csv")).shape[0]) \
+        if os.path.exists(os.path.join(folder_path, "timing.csv")) else 0
+
     summary_lines = [
         "=== Run timing summary ===",
         f"Total run wall time:           {run_wall:.2f} s",
+        f"Wall-clock budget:             "
+        f"{args.wallclock_seconds if args.wallclock_seconds > 0 else 'disabled'}"
+        + (f" s (reserve {args.final_eval_reserve_seconds} s)" if args.wallclock_seconds > 0 else ""),
+        f"Refinement iterations done:    {iters_done} (max allowed {args.iteration})",
         f"Designed binders:              {repeat_num}",
         f"Sec per designed binder:       {sec_per_designed_binder:.2f} s",
         "",

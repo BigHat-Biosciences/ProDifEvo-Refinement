@@ -71,7 +71,19 @@ def get_ab_args():
         "--metrics_list", type=str, required=True,
         help="Comma-separated weights for each metric.",
     )
-    argparser.add_argument("--iteration", type=int, default=50, help="Number of refinement iterations.")
+    argparser.add_argument("--iteration", type=int, default=50,
+                           help="Max refinement iterations. With --wallclock_seconds "
+                                "this is only an upper bound; wall clock ends the run.")
+    argparser.add_argument("--wallclock_seconds", type=int, default=0,
+                           help="Wall-clock budget for the whole run in seconds "
+                                "(0 = disabled, use --iteration only). No new refinement "
+                                "iteration is started once the budget, minus "
+                                "--final_eval_reserve_seconds, is spent.")
+    argparser.add_argument("--final_eval_reserve_seconds", type=int, default=1800,
+                           help="Slice of the wall-clock budget held back for the final "
+                                "evaluation pass and artifact writing, which run after "
+                                "the refinement loop. Too small and the job is killed "
+                                "before it writes output.csv.")
 
     # Optional: reference PDB for structure comparison metrics
     argparser.add_argument(
