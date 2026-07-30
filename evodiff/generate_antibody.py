@@ -124,9 +124,22 @@ def generate_oaardm_cdr_edit(
             now = time.time()
             if now >= deadline:
                 return "deadline_reached"
-            refine_walls = iter_walls[1:] or iter_walls
+            refine_walls = iter_walls[1:]
             if refine_walls:
                 predicted = max(refine_walls)
+            elif iter_walls:
+                # Only iteration 0 has run. Do NOT fall back to its wall time:
+                # it unmasks all `num_cdr` positions from scratch while every
+                # later iteration unmasks only `num_to_remask`, so iteration 0
+                # costs roughly num_cdr/num_to_remask times as much (~3.5x at
+                # edit_fraction 0.3). Using it as the estimate over-predicts the
+                # next iteration by that factor and stops the run early -- which
+                # is exactly what truncated the final time-boxed replicate on
+                # bhrf1/il20/pdl1 on 2026-07-29, leaving 2-3h of budget unspent.
+                predicted = iter_walls[0] * (num_to_remask / max(num_cdr, 1))
+            else:
+                predicted = None
+            if predicted is not None:
                 if now + predicted > deadline:
                     return (f"deadline_would_overrun "
                             f"(need ~{predicted:.0f}s, have {deadline - now:.0f}s)")

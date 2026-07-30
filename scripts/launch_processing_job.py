@@ -212,9 +212,36 @@ while :; do
   partial=0
   extra=""
   if [ "$longest" -gt 0 ] && [ "$remain" -lt "$longest" ]; then
-    if [ "$remain" -lt $((RESERVE * 2)) ]; then
-      echo "[replicate] ${{remain}}s left, too little for a useful partial; stopping"
+    # THE FLOOR IS THE FIRST ITERATION, NOT A FIXED FRACTION OF THE BUDGET.
+    # ab_refinement only checks its deadline at iteration boundaries, so
+    # iteration 0 is uninterruptible once started. On 2026-07-29 il3 passed a
+    # 2*RESERVE (1h) gate with 3.5h left and then ran a 4h iteration 0, blew
+    # through the fence and was SIGKILLed -- the job reported Failed with exit
+    # 124 after 72.55h. Iteration 0 is ~num_cdr/num_to_remask of a full
+    # replicate (~3.5/7.5 at iteration=5, edit_fraction=0.3); 0.47 is that
+    # ratio, rounded down to stay conservative.
+    # FILL THE CLOCK. The point of a wall-clock run is that every method gets
+    # the same compute, so we keep starting replicates while meaningful time
+    # remains and let the last one be truncated. That is safe now: each
+    # replicate is capped at the time actually left, and rc=124 is recorded as
+    # truncated_at_budget rather than propagating as a job failure.
+    #
+    # A replicate truncated during iteration 0 yields no designs, because the
+    # first checkpoint is only written at an iteration boundary. That is
+    # accepted deliberately -- under-running the budget by hours to avoid a
+    # wasted fragment is the worse trade when the comparison is per-wall-clock.
+    # This is the opposite of the 2026-07-29 behaviour, where a 1h gate let il3
+    # start a 4h iteration and get SIGKILLed; the difference is that truncation
+    # is now graceful instead of fatal.
+    iter0=$(( longest * 47 / 100 ))
+    if [ "$remain" -lt "$RESERVE" ]; then
+      echo "[replicate] only ${{remain}}s left, under the ${{RESERVE}}s floor; stopping"
       break
+    fi
+    if [ "$remain" -lt "$iter0" ]; then
+      echo "[replicate] ${{remain}}s left, under the ~${{iter0}}s first iteration --"
+      echo "[replicate] starting anyway to consume the budget; expect truncation with"
+      echo "[replicate] checkpoints only and no output.csv for this replicate."
     fi
     # Hand the leftover to a time-boxed replicate. It runs as many refinement
     # iterations as fit and still writes a real output.csv, instead of the tail
@@ -230,7 +257,15 @@ while :; do
   echo "[replicate] === replicate $i | seed $seed | ${{remain}}s left | partial=$partial ==="
   t0=$(date +%s)
   started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # Cap each replicate at the time actually remaining. A truncated final
+  # replicate is an EXPECTED outcome of a wall-clock run, not a failure, so it
+  # is bounded here and its rc=124 is translated below. Without this the only
+  # thing that could stop an overrunning replicate was the job-level fence,
+  # which SIGKILLs and makes SageMaker report the whole run Failed.
+  cap=$(( END - $(date +%s) ))
+  [ "$cap" -lt 60 ] && cap=60
   set +e
+  timeout --preserve-status -s TERM -k 120s "${{cap}}s" \\
   python ab_refinement.py "$@" \\
     --seed "$seed" \\
     --run_name "${{RUN_NAME}}_rep$(printf '%03d' $i)" \\
@@ -245,6 +280,16 @@ while :; do
     # Only full replicates inform the fit prediction; a time-boxed one is short
     # by construction and would make us over-optimistic about the next.
     if [ "$partial" -eq 0 ] && [ "$dur" -gt "$longest" ]; then longest=$dur; fi
+  elif [ "$rc" -eq 124 ] || [ "$rc" -eq 143 ]; then
+    # 124 = timeout fired, 143 = SIGTERM. The budget ran out mid-replicate. The
+    # per-iteration output_checkpoint.csv files are already flushed and uploaded,
+    # so this replicate still contributed usable designs; it just has no
+    # output.csv. Recording it as truncated rather than failed is the honest
+    # label, and it must NOT propagate as a job failure.
+    status=truncated_at_budget
+    partial=1
+    echo "[replicate] replicate $i hit the wall-clock budget after ${{dur}}s."
+    echo "[replicate] Its per-iteration checkpoints are on S3; no output.csv."
   else
     status="failed_rc$rc"
     echo "[replicate] replicate $i FAILED rc=$rc after ${{dur}}s -- continuing to the next"
